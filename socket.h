@@ -449,3 +449,197 @@ class SocketTcpServer {
     Conn conns_data_[Conf::MaxConns];
     char last_error_[64] = "";
 };
+
+template <uint32_t RecvBufSize = 1500>
+class SocketUdpReceiver {
+   public:
+    bool init(const char* interface_ip, const char* dest_ip, uint16_t dest_port,
+              const char* subscribe_ip = "") {
+        ensure_network_init();  // 触发全局一次性的 WSAStartup (Windows)
+
+        if ((fd_ = socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET_FD) {
+            saveError("socket error");
+            return false;
+        }
+
+        if (!set_nonblocking(fd_)) {
+            close("set nonblock error");
+            return false;
+        }
+
+        int optval = 1;
+        if (setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<sockopt_val_t>(&optval), sizeof(int)) < 0) {
+            close("setsockopt SO_REUSEADDR error");
+            return false;
+        }
+
+        struct sockaddr_in servaddr;
+        memset(&servaddr, 0, sizeof(servaddr));
+        servaddr.sin_family = AF_INET;  // IPv4
+        servaddr.sin_port = htons(dest_port);
+        inet_pton(AF_INET, dest_ip, &(servaddr.sin_addr));
+
+        if (::bind(fd_, reinterpret_cast<const struct sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
+            close("bind failed");
+            return false;
+        }
+
+        if (subscribe_ip[0]) {
+            struct ip_mreq group;
+            inet_pton(AF_INET, subscribe_ip, &(group.imr_interface));
+            inet_pton(AF_INET, dest_ip, &(group.imr_multiaddr));
+
+            if (setsockopt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<sockopt_val_t>(&group), sizeof(group)) < 0) {
+                close("setsockopt IP_ADD_MEMBERSHIP failed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    ~SocketUdpReceiver() { close("destruct"); }
+
+    uint16_t getLocalPort() {
+        struct sockaddr_in addr;
+        socklen_t addrlen = sizeof(addr);
+        // getscockname 在 Windows 上通常返回 0 成功，SOCKET_ERROR 失败
+        getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen);
+        return ntohs(addr.sin_port);
+    }
+
+    const char* getLastError() { return last_error_; }
+
+    bool isClosed() { return fd_ == INVALID_SOCKET_FD; }
+
+    void close(const char* reason) {
+        if (fd_ != INVALID_SOCKET_FD) {
+            saveError(reason);
+            close_socket(fd_);
+            fd_ = INVALID_SOCKET_FD;
+        }
+    }
+
+    template <typename Handler>
+    bool read(Handler handler) {
+        // 跨平台统一使用 recv 替代原先的 read
+        int n = ::recv(fd_, reinterpret_cast<char*>(buf), RecvBufSize, 0);
+        if (n > 0) {
+            handler(buf, n);
+            return true;
+        }
+        return false;
+    }
+
+    template <typename Handler>
+    bool recvfrom(Handler handler) {
+        struct sockaddr_in src_addr;
+        socklen_t addrlen = sizeof(src_addr);
+        int n = ::recvfrom(fd_, reinterpret_cast<char*>(buf), RecvBufSize, 0,
+                           reinterpret_cast<struct sockaddr*>(&src_addr), &addrlen);
+        if (n > 0) {
+            handler(buf, n, src_addr);
+            return true;
+        }
+        return false;
+    }
+
+    bool sendto(const void* data, uint32_t size, const sockaddr_in& dst_addr) {
+        return ::sendto(fd_, reinterpret_cast<const char*>(data), size, 0,
+                        reinterpret_cast<const struct sockaddr*>(&dst_addr), sizeof(dst_addr)) == static_cast<int>(size);
+    }
+
+   private:
+    void saveError(const char* msg) {
+        int err = get_last_error();
+#ifdef _WIN32
+        snprintf(last_error_, sizeof(last_error_), "%s (WSA_ERR:%d)", msg, err);
+#else
+        snprintf(last_error_, sizeof(last_error_), "%s %s", msg, strerror(err));
+#endif
+    }
+
+    socket_t fd_ = INVALID_SOCKET_FD;
+    uint8_t buf[RecvBufSize];
+    char last_error_[64] = "";
+};
+
+class SocketUdpSender {
+   public:
+    bool init(const char* interface_ip, const char* local_ip, uint16_t local_port, const char* dest_ip,
+              uint16_t dest_port) {
+        ensure_network_init();
+
+        if ((fd_ = socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET_FD) {
+            saveError("socket error");
+            return false;
+        }
+
+        if (!set_nonblocking(fd_)) {
+            close("set nonblock error");
+            return false;
+        }
+
+        struct sockaddr_in localaddr;
+        memset(&localaddr, 0, sizeof(localaddr));
+        localaddr.sin_family = AF_INET;  // IPv4
+        localaddr.sin_port = htons(local_port);
+        inet_pton(AF_INET, local_ip, &(localaddr.sin_addr));
+
+        if (::bind(fd_, reinterpret_cast<const struct sockaddr*>(&localaddr), sizeof(localaddr)) < 0) {
+            close("bind failed");
+            return false;
+        }
+
+        struct sockaddr_in destaddr;
+        memset(&destaddr, 0, sizeof(destaddr));
+        destaddr.sin_family = AF_INET;  // IPv4
+        destaddr.sin_port = htons(dest_port);
+        inet_pton(AF_INET, dest_ip, &(destaddr.sin_addr));
+
+        if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&destaddr), sizeof(destaddr)) < 0) {
+            close("connect error");
+            return false;
+        }
+
+        return true;
+    }
+
+    ~SocketUdpSender() { close("destruct"); }
+
+    uint16_t getLocalPort() {
+        struct sockaddr_in addr;
+        socklen_t addrlen = sizeof(addr);
+        getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen);
+        return ntohs(addr.sin_port);
+    }
+
+    const char* getLastError() { return last_error_; }
+
+    bool isClosed() { return fd_ == INVALID_SOCKET_FD; }
+
+    void close(const char* reason) {
+        if (fd_ != INVALID_SOCKET_FD) {
+            saveError(reason);
+            close_socket(fd_);
+            fd_ = INVALID_SOCKET_FD;
+        }
+    }
+
+    bool write(const void* data, uint32_t size) {
+        return ::send(fd_, reinterpret_cast<const char*>(data), size, 0) == static_cast<int>(size);
+    }
+
+   private:
+    void saveError(const char* msg) {
+        int err = get_last_error();
+#ifdef _WIN32
+        snprintf(last_error_, sizeof(last_error_), "%s (WSA_ERR:%d)", msg, err);
+#else
+        snprintf(last_error_, sizeof(last_error_), "%s %s", msg, strerror(err));
+#endif
+    }
+
+    socket_t fd_ = INVALID_SOCKET_FD;
+    char last_error_[64] = "";
+};
