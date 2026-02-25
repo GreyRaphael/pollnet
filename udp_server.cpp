@@ -1,7 +1,9 @@
 #include <print>
+#include <span>
 #include <string_view>
 
 #include "socket.h"
+
 
 struct MsgHeader {
     uint32_t type;
