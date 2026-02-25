@@ -1,5 +1,3 @@
-#include <atomic>
-#include <csignal>
 #include <cstdint>
 #include <print>
 #include <string_view>
@@ -18,73 +16,89 @@ struct ServerConf {
 
 using TcpServer = SocketTcpServer<ServerConf>;
 
-// 使用 atomic 确保信号处理函数与主循环之间的内存可见性
-std::atomic<bool> running{true};
+struct MsgHeader {
+    uint32_t body_len;
+};
 
-// 信号处理回调
-void signal_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) {
-        running = false;
-    }
-}
-
-TcpServer server;
-
-std::string to_upper(std::string_view sv) {
+std::string upper_and_double(std::string_view sv) {
     std::string out;
-    out.reserve(sv.size());
+    out.reserve(sv.size() * 2);  // 一次分配到位
 
-    // 使用 C++20 ranges 将转换后的字符直接放入 string
+    // 第一次：转换并存入
     std::ranges::transform(sv, std::back_inserter(out), [](unsigned char c) {
-        return std::toupper(c);
+        return static_cast<char>(std::toupper(c));
     });
+
+    // 第二次：直接把前半部分拷贝到后半部分，无需再调用 toupper
+    out.append(out);
 
     return out;
 }
 
-int main(int argc, char **argv) {
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+class MyServer : public TcpServer {
+   private:
+    /* data */
+   public:
+    MyServer(/* args */) {}
+    ~MyServer() = default;
 
+    void onTcpConnected(TcpServer::Conn& conn) {
+        conn.getPeername(conn.addr);
+        std::println("new connection from {}:{}, total={}", inet_ntoa(conn.addr.sin_addr), ntohs(conn.addr.sin_port), getConnCnt());
+        /*
+        server.foreachConn([&](TcpServer::Conn& conn) {
+          cout << "current connection from: " << inet_ntoa(conn.addr.sin_addr) << ":" << ntohs(conn.addr.sin_port)
+               << endl;
+        });
+        */
+    }
+    void onSendTimeout(TcpServer::Conn& conn) {
+        std::println("onSendTimeout should not be called as SendTimeoutSec=0");
+        exit(1);
+    }
+    uint32_t onTcpData(TcpServer::Conn& conn, const uint8_t* data, uint32_t size) {
+        while (size >= sizeof(MsgHeader)) {
+            // handle header
+            const auto* req_header = reinterpret_cast<const MsgHeader*>(data);
+            uint32_t req_body_len = req_header->body_len;
+            uint32_t total_len = sizeof(MsgHeader) + req_body_len;
+
+            if (size < total_len) {
+                break;
+            }
+
+            // handle body
+            std::string_view req_body{reinterpret_cast<const char*>(data) + sizeof(MsgHeader), req_body_len};
+
+            std::println("Recv Body [len: {}]: {}", req_body_len, req_body);
+            auto result = upper_and_double(req_body);
+            MsgHeader rsp_header;
+            rsp_header.body_len = result.size();
+            conn.write(&rsp_header, sizeof(MsgHeader));
+            conn.write(result.data(), result.size());
+
+            data += total_len;
+            size -= total_len;
+        }
+        return size;
+    }
+    void onRecvTimeout(TcpServer::Conn& conn) {
+        std::println("onRecvTimeout");
+        conn.close("timeout");
+    }
+    void onTcpDisconnect(TcpServer::Conn& conn) {
+        std::println("clientdisconnected: {}:{}, reason={}, total={}", inet_ntoa(conn.addr.sin_addr), ntohs(conn.addr.sin_port), conn.getLastError(), getConnCnt());
+    }
+};
+
+int main(int argc, char const* argv[]) {
+    MyServer server;
     if (!server.init("", "127.0.0.1", 1234)) {
         std::println("init failed: {}", server.getLastError());
         return 1;
     }
-
-    while (running) {
-        struct
-        {
-            void onTcpConnected(TcpServer::Conn &conn) {
-                conn.getPeername(conn.addr);
-                std::println("new connection from {}:{}, total={}", inet_ntoa(conn.addr.sin_addr), ntohs(conn.addr.sin_port), server.getConnCnt());
-                /*
-                server.foreachConn([&](TcpServer::Conn& conn) {
-                  cout << "current connection from: " << inet_ntoa(conn.addr.sin_addr) << ":" << ntohs(conn.addr.sin_port)
-                       << endl;
-                });
-                */
-            }
-            void onSendTimeout(TcpServer::Conn &conn) {
-                std::println("onSendTimeout should not be called as SendTimeoutSec=0");
-                exit(1);
-            }
-            uint32_t onTcpData(TcpServer::Conn &conn, const uint8_t *data, uint32_t size) {
-                std::string_view sv{reinterpret_cast<const char *>(data), size};
-                std::println("Received {} bytes from server: {}", size, sv);
-                auto result = to_upper(sv);
-
-                conn.write(result.data(), result.size());
-                return 0;
-            }
-            void onRecvTimeout(TcpServer::Conn &conn) {
-                std::println("onRecvTimeout");
-                conn.close("timeout");
-            }
-            void onTcpDisconnect(TcpServer::Conn &conn) {
-                std::println("clientdisconnected: {}:{}, reason={}, total={}", inet_ntoa(conn.addr.sin_addr), ntohs(conn.addr.sin_port), conn.getLastError(), server.getConnCnt());
-            }
-        } handler;
-        server.poll(handler);
+    while (true) {
+        server.poll(server);
     }
 
     return 0;

@@ -10,8 +10,7 @@ struct ClientConf {
     static const uint32_t ConnTimeoutSec = 30;
     static const uint32_t SendTimeoutSec = 0;
     static const uint32_t RecvTimeoutSec = 0;
-    struct UserData {
-    };
+    struct UserData {};
 };
 
 using TcpClient = SocketTcpClient<ClientConf>;
@@ -29,7 +28,7 @@ class MyClient : public TcpClient {
     ~MyClient() = default;
 
     void onTcpConnectFailed() { std::println("connect error:{}", this->getLastError()); }
-    void onTcpConnected(TcpClient::Conn &conn) {
+    void onTcpConnected(TcpClient::Conn& conn) {
         std::println("connected! first={}", is_first);
         if (is_first) {
             MsgHeader header;
@@ -42,18 +41,16 @@ class MyClient : public TcpClient {
         }
         is_first = false;
     }
-    void onTcpDisconnect(TcpClient::Conn &conn) {
-        std::println("disconnected!");
-    }
-    void onSendTimeout(TcpClient::Conn &conn) { std::println("send timeout"); }
-    void onRecvTimeout(TcpClient::Conn &conn) {
+    void onTcpDisconnect(TcpClient::Conn& conn) { std::println("disconnected!"); }
+    void onSendTimeout(TcpClient::Conn& conn) { std::println("send timeout"); }
+    void onRecvTimeout(TcpClient::Conn& conn) {
         std::println("recv timeout");
         conn.close("onRecvTimeout");
     }
-    uint32_t onTcpData(TcpClient::Conn &conn, const uint8_t *data, uint32_t size) {
+    uint32_t onTcpData(TcpClient::Conn& conn, const uint8_t* data, uint32_t size) {
         while (size >= sizeof(MsgHeader)) {
             // 1. 解析 Header
-            const auto *header = reinterpret_cast<const MsgHeader *>(data);
+            const auto* header = reinterpret_cast<const MsgHeader*>(data);
             uint32_t body_len = header->body_len;
             uint32_t total_len = sizeof(MsgHeader) + body_len;
 
@@ -66,7 +63,7 @@ class MyClient : public TcpClient {
 
             // 3. 处理 Body (使用 string_view 避免拷贝)
             std::string_view body{
-                reinterpret_cast<const char *>(data) + sizeof(MsgHeader),
+                reinterpret_cast<const char*>(data) + sizeof(MsgHeader),
                 body_len};
 
             std::println("Recv Body [len: {}]: {}", body_len, body);
@@ -80,7 +77,7 @@ class MyClient : public TcpClient {
     }
 };
 
-int main(int argc, char const *argv[]) {
+int main(int argc, char const* argv[]) {
     MyClient client;
     if (!client.init("", "127.0.0.1", 1234)) {
         std::println("init error:{}", client.getLastError());
