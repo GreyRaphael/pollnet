@@ -12,7 +12,11 @@
 #include <type_traits>
 #include <vector>
 
+#include "pollnet/eventloop.h"
 #include "pollnet/socket.h"
+#ifdef __linux__
+#include "pollnet/iouring.h"
+#endif
 
 namespace {
 
@@ -66,6 +70,18 @@ static_assert(!std::is_copy_constructible_v<pollnet::TcpServer<>>);
 static_assert(!std::is_copy_assignable_v<pollnet::TcpServer<>>);
 static_assert(!std::is_move_constructible_v<pollnet::TcpServer<>>);
 static_assert(!std::is_move_assignable_v<pollnet::TcpServer<>>);
+
+static_assert(!std::is_copy_constructible_v<pollnet::EventLoopTcpServer<>>);
+static_assert(!std::is_copy_assignable_v<pollnet::EventLoopTcpServer<>>);
+static_assert(!std::is_move_constructible_v<pollnet::EventLoopTcpServer<>>);
+static_assert(!std::is_move_assignable_v<pollnet::EventLoopTcpServer<>>);
+
+#ifdef __linux__
+static_assert(!std::is_copy_constructible_v<pollnet::IoUringTcpServer<>>);
+static_assert(!std::is_copy_assignable_v<pollnet::IoUringTcpServer<>>);
+static_assert(!std::is_move_constructible_v<pollnet::IoUringTcpServer<>>);
+static_assert(!std::is_move_assignable_v<pollnet::IoUringTcpServer<>>);
+#endif
 
 static_assert(!std::is_copy_constructible_v<pollnet::UdpSocket<>>);
 static_assert(!std::is_copy_assignable_v<pollnet::UdpSocket<>>);
@@ -211,7 +227,6 @@ bool test_invalid_options_and_reinit() {
 // ==========================================
 
 bool test_tcp_minimal_and_full_handler() {
-    // 4a. 仅实现 onData 的极简 Handler
     {
         pollnet::TcpServer<> server;
         CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
@@ -247,7 +262,6 @@ bool test_tcp_minimal_and_full_handler() {
         }));
     }
 
-    // 4b. allowNewConnection 过滤 + UserData + peer + foreachConn + span
     struct TagData {
         uint64_t tag = 0;
     };
@@ -302,7 +316,6 @@ bool test_tcp_minimal_and_full_handler() {
         }
     };
 
-    // 先验证 allowNewConnection 返回 false 拒绝连接且不占槽位
     TagClient rejected_client;
     FullCliHandler rejected_h;
     CHECK(rejected_client.connect({.host = "127.0.0.1", .port = port}));
@@ -314,7 +327,6 @@ bool test_tcp_minimal_and_full_handler() {
     CHECK(server.connCount() == 0);
     CHECK(srv_h.connected == 0);
 
-    // 放行新连接
     srv_h.allow = true;
     TagClient client;
     FullCliHandler cli_h;
@@ -366,7 +378,85 @@ bool test_tcp_minimal_and_full_handler() {
 }
 
 // ==========================================
-// 5. TCP 粘包、半包与 memmove 压缩恢复
+// 5. 内核调优参数与 TCP writev 向量写测试
+// ==========================================
+
+bool test_tcp_tuning_and_writev() {
+    pollnet::TcpServer<> server;
+    CHECK(server.listen({.host = "127.0.0.1",
+                         .port = 0,
+                         .accept_poll_interval = 8,
+                         .tcp_quickack = true,
+                         .busy_poll_us = 25,
+                         .recv_buf_bytes = 65536,
+                         .send_buf_bytes = 65536}));
+
+    pollnet::TcpClient<> client;
+    CHECK(client.connect({.host = "127.0.0.1",
+                          .port = server.localPort(),
+                          .tcp_quickack = true,
+                          .busy_poll_us = 25,
+                          .recv_buf_bytes = 65536,
+                          .send_buf_bytes = 65536}));
+
+    struct SrvHandler {
+        std::string recv_all;
+        size_t onData(pollnet::TcpConnection<>& conn, std::span<const uint8_t> data) {
+            recv_all.append(reinterpret_cast<const char*>(data.data()), data.size());
+            const std::string_view p1 = "ack:";
+            std::array<pollnet::IoSlice, 2> iov{{{p1}, {data}}};
+            [[maybe_unused]] bool ok = conn.writevNonblock(iov);
+            return data.size();
+        }
+    } srv_h;
+
+    struct CliHandler {
+        std::string recv_all;
+        size_t onData(pollnet::TcpConnection<>&, std::span<const uint8_t> data) {
+            recv_all.append(reinterpret_cast<const char*>(data.data()), data.size());
+            return data.size();
+        }
+    } cli_h;
+
+    CHECK(poll_until([&]() {
+        server.poll(srv_h);
+        client.poll(cli_h);
+        return client.isConnected() && server.connCount() == 1;
+    }));
+
+    // 混合空 slice、string_view、span<uint8_t>、span<std::byte>
+    const std::string s1 = "vec-";
+    const std::array<uint8_t, 3> s2{'i', 'o', '-'};
+    const std::array<std::byte, 2> s3{std::byte{'o'}, std::byte{'k'}};
+    std::array<pollnet::IoSlice, 5> slices{{
+        {nullptr, 0},
+        {s1},
+        {std::span<const uint8_t>{s2}},
+        {nullptr, 0},
+        {std::span<const std::byte>{s3}},
+    }};
+    CHECK(client.writevNonblock(slices));
+
+    // 再测 writev 多片写入（超过 64 个 slice 验证分块逻辑）
+    std::vector<pollnet::IoSlice> many_slices;
+    const std::string unit = "X";
+    for (int i = 0; i < 70; ++i) {
+        many_slices.emplace_back(unit);
+    }
+    CHECK(client.writev(many_slices));
+
+    const std::string expected_srv = "vec-io-ok" + std::string(70, 'X');
+    CHECK(poll_until([&]() {
+        server.poll(srv_h);
+        client.poll(cli_h);
+        return srv_h.recv_all == expected_srv && cli_h.recv_all.size() >= expected_srv.size();
+    }));
+
+    return true;
+}
+
+// ==========================================
+// 6. TCP 粘包、半包与 memmove 压缩恢复
 // ==========================================
 
 std::vector<uint8_t> make_frame(std::string_view payload) {
@@ -421,7 +511,6 @@ bool test_tcp_framing_and_compaction() {
         return srv_h.connected == 1 && cli_h.connected == 1;
     }));
 
-    // 5a. 粘包测试
     std::vector<uint8_t> coalesced;
     for (std::string_view s : {"alpha", "beta", "gamma"}) {
         auto f = make_frame(s);
@@ -436,7 +525,6 @@ bool test_tcp_framing_and_compaction() {
     CHECK(srv_h.frames[1] == "beta");
     CHECK(srv_h.frames[2] == "gamma");
 
-    // 5b. 逐字节半包测试
     auto frag = make_frame("split-frame-ok");
     for (uint8_t b : frag) {
         CHECK(client.write(&b, 1));
@@ -449,10 +537,9 @@ bool test_tcp_framing_and_compaction() {
     }));
     CHECK(srv_h.frames[3] == "split-frame-ok");
 
-    // 5c. tail_ == 64 且 0 < head_(10) < 32 时 memmove 压缩恢复
-    auto f10 = make_frame("123456");  // 10 字节
+    auto f10 = make_frame("123456");
     std::string payload56(56, 'Z');
-    auto f60 = make_frame(payload56);  // 60 字节
+    auto f60 = make_frame(payload56);
     std::vector<uint8_t> batch;
     batch.insert(batch.end(), f10.begin(), f10.end());
     batch.insert(batch.end(), f60.begin(), f60.begin() + 54);
@@ -482,14 +569,13 @@ bool test_tcp_framing_and_compaction() {
 }
 
 // ==========================================
-// 6. 非法 consumed 与单包填满 RecvBufSize 防护
+// 7. 非法 consumed 与单包填满 RecvBufSize 防护
 // ==========================================
 
 bool test_tcp_bad_consumed_and_buf_full() {
     using SmallServer = pollnet::TcpServer<pollnet::EmptyUserData, 64, 4>;
     using SmallClient = pollnet::TcpClient<pollnet::EmptyUserData, 64>;
 
-    // 6a. consumed > avail
     {
         SmallServer server;
         CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
@@ -531,7 +617,6 @@ bool test_tcp_bad_consumed_and_buf_full() {
         CHECK(srv_h.reason == "invalid consumed size");
     }
 
-    // 6b. 单包占满 64 字节且不消费触发 recv buf full
     {
         SmallServer server;
         CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
@@ -577,7 +662,7 @@ bool test_tcp_bad_consumed_and_buf_full() {
 }
 
 // ==========================================
-// 7. 未监听端口快速失败 + allowReconnect 恢复
+// 8. 未监听端口快速失败 + allowReconnect 恢复
 // ==========================================
 
 bool test_tcp_connect_fail_and_allow_reconnect() {
@@ -636,13 +721,12 @@ bool test_tcp_connect_fail_and_allow_reconnect() {
 }
 
 // ==========================================
-// 8. 亚秒级运行时超时 + 外部时间戳注入测试
+// 9. 亚秒级运行时超时 + 外部时间戳注入测试
 // ==========================================
 
 bool test_tcp_subsecond_timeouts_and_custom_clock() {
     using namespace std::chrono_literals;
 
-    // 8a. 真实时钟 150ms 亚秒级超时
     {
         pollnet::TcpServer<> server;
         CHECK(server.listen({.host = "127.0.0.1", .port = 0, .recv_timeout = 150ms}));
@@ -693,7 +777,6 @@ bool test_tcp_subsecond_timeouts_and_custom_clock() {
         }));
     }
 
-    // 8b. 外部注入时间戳 poll(handler, now_ns)
     {
         pollnet::TcpServer<> server;
         CHECK(server.listen({.host = "127.0.0.1", .port = 0, .recv_timeout = 150ms}));
@@ -748,7 +831,7 @@ bool test_tcp_subsecond_timeouts_and_custom_clock() {
 }
 
 // ==========================================
-// 9. MaxConns 上限与断开后槽位复用
+// 10. MaxConns 上限与断开后槽位复用
 // ==========================================
 
 bool test_tcp_max_conns_and_slot_reuse() {
@@ -817,11 +900,212 @@ bool test_tcp_max_conns_and_slot_reuse() {
 }
 
 // ==========================================
-// 10. UDP Receiver/Sender 与统一 UdpSocket 回环测试
+// 11. 通用服务端后端验证（EventLoopTcpServer & IoUringTcpServer）
 // ==========================================
 
-bool test_udp_loopback() {
-    // 10a. UdpReceiver + UdpSender
+template <template <typename, size_t, size_t> class ServerT>
+bool test_server_backend_suite() {
+    using namespace std::chrono_literals;
+    using Srv = ServerT<pollnet::EmptyUserData, 64, 2>;
+    using Cli = pollnet::TcpClient<pollnet::EmptyUserData, 64>;
+
+    // 11a. allowNewConnection、粘包/半包、MaxConns 槽位复用与 foreachConn
+    {
+        Srv server;
+        CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
+        uint16_t port = server.localPort();
+        CHECK(port != 0);
+
+        struct BackendHandler {
+            bool allow = false;
+            int rejected = 0;
+            int connected = 0;
+            int disconnected = 0;
+            std::vector<std::string> frames;
+
+            bool allowNewConnection(const pollnet::Endpoint&) {
+                if (!allow) {
+                    ++rejected;
+                    return false;
+                }
+                return true;
+            }
+            void onConnect(typename Srv::Conn&) { ++connected; }
+            void onDisconnect(typename Srv::Conn&) { ++disconnected; }
+            size_t onData(typename Srv::Conn& conn, std::span<const uint8_t> data) {
+                size_t offset = 0;
+                while (data.size() - offset >= sizeof(uint32_t)) {
+                    uint32_t len = 0;
+                    std::memcpy(&len, data.data() + offset, sizeof(uint32_t));
+                    if (data.size() - offset - sizeof(uint32_t) < len) break;
+                    frames.emplace_back(
+                        reinterpret_cast<const char*>(data.data() + offset + sizeof(uint32_t)),
+                        len);
+                    auto sub = data.subspan(offset, sizeof(uint32_t) + len);
+                    [[maybe_unused]] bool ok = conn.writeNonblock(sub);
+                    offset += sizeof(uint32_t) + len;
+                }
+                return offset;
+            }
+        } srv_h;
+
+        struct CliHandler {
+            int connected = 0;
+            int disconnected = 0;
+            int failed = 0;
+            std::string recv_all;
+            void onConnectFailed() { ++failed; }
+            void onConnect(Cli::Conn&) { ++connected; }
+            void onDisconnect(Cli::Conn&) { ++disconnected; }
+            size_t onData(Cli::Conn&, std::span<const uint8_t> data) {
+                recv_all.append(reinterpret_cast<const char*>(data.data()), data.size());
+                return data.size();
+            }
+        };
+
+        Cli c_rej;
+        CliHandler h_rej;
+        CHECK(c_rej.connect({.host = "127.0.0.1", .port = port}));
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 0);
+            c_rej.poll(h_rej);
+            return srv_h.rejected == 1 && (h_rej.disconnected >= 1 || h_rej.failed >= 1);
+        }));
+        CHECK(server.connCount() == 0);
+
+        srv_h.allow = true;
+        Cli c1, c2, c3;
+        CliHandler h1, h2, h3;
+        CHECK(c1.connect({.host = "127.0.0.1", .port = port}));
+        CHECK(c2.connect({.host = "127.0.0.1", .port = port}));
+
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 0);
+            c1.poll(h1);
+            c2.poll(h2);
+            return srv_h.connected == 2 && h1.connected == 1 && h2.connected == 1;
+        }));
+        CHECK(server.connCount() == 2);
+
+        size_t iter_cnt = 0;
+        server.foreachConn([&](typename Srv::Conn&) { ++iter_cnt; });
+        CHECK(iter_cnt == 2);
+
+        // 粘包 + 半包发送
+        auto f1 = make_frame("ev1");
+        auto f2 = make_frame("ev2");
+        CHECK(c1.write(f1.data(), 2));
+        server.poll(srv_h, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(c1.write(f1.data() + 2, f1.size() - 2));
+        CHECK(c1.write(std::span<const uint8_t>{f2}));
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 0);
+            c1.poll(h1);
+            return srv_h.frames.size() == 2 && h1.recv_all.size() == f1.size() + f2.size();
+        }));
+        CHECK(srv_h.frames[0] == "ev1");
+        CHECK(srv_h.frames[1] == "ev2");
+
+        // 第 3 个客户端在满槽时不得接纳
+        CHECK(c3.connect({.host = "127.0.0.1", .port = port}));
+        for (int i = 0; i < 30; ++i) {
+            server.poll(srv_h, 0);
+            c3.poll(h3);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(server.connCount() == 2);
+        CHECK(srv_h.connected == 2);
+
+        // 断开 c1 释放槽位并接纳 c3
+        c1.close("release");
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 0);
+            c3.poll(h3);
+            return srv_h.disconnected == 1 && srv_h.connected == 3 && h3.connected == 1;
+        }));
+        CHECK(server.connCount() == 2);
+
+        auto f3 = make_frame("c3-ok");
+        CHECK(c3.write(std::span<const uint8_t>{f3}));
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 0);
+            c3.poll(h3);
+            return srv_h.frames.size() == 3 && h3.recv_all.size() == f3.size();
+        }));
+        CHECK(srv_h.frames[2] == "c3-ok");
+    }
+
+    // 11b. recv_timeout 触发与关闭后槽位回收
+    {
+        Srv server;
+        CHECK(server.listen({.host = "127.0.0.1", .port = 0, .recv_timeout = 120ms}));
+        uint16_t port = server.localPort();
+
+        Cli client;
+        CHECK(client.connect({.host = "127.0.0.1", .port = port}));
+
+        struct TimeoutSrvHandler {
+            int connected = 0;
+            int recv_timeouts = 0;
+            int disconnected = 0;
+            void onConnect(typename Srv::Conn&) { ++connected; }
+            void onDisconnect(typename Srv::Conn&) { ++disconnected; }
+            void onRecvTimeout(typename Srv::Conn& c) {
+                ++recv_timeouts;
+                c.close("timeout");
+            }
+            size_t onData(typename Srv::Conn&, std::span<const uint8_t> data) {
+                return data.size();
+            }
+        } srv_h;
+
+        struct IdleCli {
+            int connected = 0;
+            int disconnected = 0;
+            void onConnect(Cli::Conn&) { ++connected; }
+            void onDisconnect(Cli::Conn&) { ++disconnected; }
+            size_t onData(Cli::Conn&, std::span<const uint8_t> data) { return data.size(); }
+        } cli_h;
+
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 0);
+            client.poll(cli_h);
+            return srv_h.connected == 1 && cli_h.connected == 1;
+        }));
+
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 5);
+            client.poll(cli_h);
+            return srv_h.recv_timeouts >= 1 && srv_h.disconnected == 1 && cli_h.disconnected == 1;
+        }));
+        CHECK(server.connCount() == 0);
+
+        // 验证超时回收槽位后可继续接纳新连接
+        Cli client2;
+        IdleCli cli_h2;
+        CHECK(client2.connect({.host = "127.0.0.1", .port = port}));
+        CHECK(poll_until([&]() {
+            server.poll(srv_h, 5);
+            client2.poll(cli_h2);
+            return srv_h.connected == 2 && cli_h2.connected == 1;
+        }));
+    }
+
+    return true;
+}
+
+bool test_eventloop_backend() { return test_server_backend_suite<pollnet::EventLoopTcpServer>(); }
+
+#ifdef __linux__
+bool test_iouring_backend() { return test_server_backend_suite<pollnet::IoUringTcpServer>(); }
+#endif
+
+// ==========================================
+// 12. UDP 单包与批量收发回环测试
+// ==========================================
+
+bool test_udp_loopback_and_batch() {
     pollnet::UdpReceiver<1500> rx1;
     pollnet::UdpReceiver<1500> rx2;
     CHECK(rx1.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
@@ -882,7 +1166,39 @@ bool test_udp_loopback() {
     }));
     CHECK(rx2_msg == pong);
 
-    // 10b. 统一 UdpSocket（双向收发 + connect/send + sendTo/recvFrom）
+    // 批量发送 sendBatch + sendToBatch + recvBatch + recvFromBatch
+    const std::array<std::string, 4> batch_msgs = {"b0", "b1", "b2", "b3"};
+    std::array<std::span<const uint8_t>, 4> batch_spans;
+    for (size_t i = 0; i < 4; ++i) {
+        batch_spans[i] = std::span<const uint8_t>{
+            reinterpret_cast<const uint8_t*>(batch_msgs[i].data()), batch_msgs[i].size()};
+    }
+    CHECK(tx.sendBatch(batch_spans) == 4);
+
+    std::vector<std::string> got_batch;
+    CHECK(poll_until([&]() {
+        [[maybe_unused]] size_t n = rx1.recvBatch<8>([&](std::span<const uint8_t> data) {
+            got_batch.emplace_back(reinterpret_cast<const char*>(data.data()), data.size());
+        });
+        return got_batch.size() == 4;
+    }));
+    CHECK(got_batch[0] == "b0" && got_batch[3] == "b3");
+
+    CHECK(rx1.sendToBatch(batch_spans, dst_rx2) == 4);
+    std::vector<std::string> got_batch2;
+    CHECK(poll_until([&]() {
+        [[maybe_unused]] size_t n = rx2.recvFromBatch<8>(
+            [&](std::span<const uint8_t> data, const pollnet::Endpoint& peer) {
+                if (peer.port() == rx1_port) {
+                    got_batch2.emplace_back(reinterpret_cast<const char*>(data.data()),
+                                            data.size());
+                }
+            });
+        return got_batch2.size() == 4;
+    }));
+    CHECK(got_batch2[1] == "b1" && got_batch2[2] == "b2");
+
+    // 统一 UdpSocket 批量与单包收发
     pollnet::UdpSocket<1500> u1;
     pollnet::UdpSocket<1500> u2;
     CHECK(u1.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
@@ -891,18 +1207,17 @@ bool test_udp_loopback() {
                    .dest_ip = "127.0.0.1",
                    .dest_port = u1.localPort()}));
 
-    const std::string u2_to_u1 = "unified-send";
-    CHECK(u2.send(u2_to_u1.data(), u2_to_u1.size()));
-
-    std::string u1_got;
+    CHECK(u2.sendBatch(batch_spans) == 4);
+    std::vector<std::string> u1_batch;
     pollnet::Endpoint u2_ep;
     CHECK(poll_until([&]() {
-        return u1.recvFrom([&](std::span<const uint8_t> data, const pollnet::Endpoint& peer) {
-            u1_got.assign(reinterpret_cast<const char*>(data.data()), data.size());
-            u2_ep = peer;
-        });
+        [[maybe_unused]] size_t n = u1.recvFromBatch<8>(
+            [&](std::span<const uint8_t> data, const pollnet::Endpoint& peer) {
+                u1_batch.emplace_back(reinterpret_cast<const char*>(data.data()), data.size());
+                u2_ep = peer;
+            });
+        return u1_batch.size() == 4;
     }));
-    CHECK(u1_got == u2_to_u1);
     CHECK(u2_ep.port() == u2.localPort());
 
     const std::string u1_to_u2 = "unified-sendto";
@@ -930,12 +1245,17 @@ int main() {
         {"endpoint", test_endpoint},
         {"invalid_options_and_reinit", test_invalid_options_and_reinit},
         {"tcp_minimal_and_full_handler", test_tcp_minimal_and_full_handler},
+        {"tcp_tuning_and_writev", test_tcp_tuning_and_writev},
         {"tcp_framing_and_compaction", test_tcp_framing_and_compaction},
         {"tcp_bad_consumed_and_buf_full", test_tcp_bad_consumed_and_buf_full},
         {"tcp_connect_fail_and_allow_reconnect", test_tcp_connect_fail_and_allow_reconnect},
         {"tcp_subsecond_timeouts_and_custom_clock", test_tcp_subsecond_timeouts_and_custom_clock},
         {"tcp_max_conns_and_slot_reuse", test_tcp_max_conns_and_slot_reuse},
-        {"udp_loopback", test_udp_loopback},
+        {"eventloop_backend", test_eventloop_backend},
+#ifdef __linux__
+        {"iouring_backend", test_iouring_backend},
+#endif
+        {"udp_loopback_and_batch", test_udp_loopback_and_batch},
     };
 
     for (const auto& tc : cases) {
