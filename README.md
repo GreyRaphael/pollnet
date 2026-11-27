@@ -70,15 +70,11 @@ endif()
 
 ### 方式二：作为 CMake 子目录引入
 
-将仓库放到子目录并通过 `add_subdirectory` 引入时，可关闭示例、测试与基准目标后直接链接 `pollnet`（`INTERFACE` 库）：
+将仓库放到子目录并通过 `add_subdirectory` 引入时，示例、测试与基准目标会自动关闭，直接链接 `pollnet::pollnet` 即可：
 
 ```cmake
-set(POLLNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(POLLNET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(POLLNET_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/pollnet)
-
-target_link_libraries(your_app PRIVATE pollnet)
+target_link_libraries(your_app PRIVATE pollnet::pollnet)
 ```
 
 ### 集成注意事项

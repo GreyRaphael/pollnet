@@ -1,53 +1,51 @@
 cmake_minimum_required(VERSION 3.16)
-project(pollnet VERSION 2.0.0 LANGUAGES CXX)
+project(pollnet VERSION 2.0.1 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+string(COMPARE EQUAL "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}" POLLNET_IS_TOP_LEVEL)
 
-option(POLLNET_BUILD_EXAMPLES "Build pollnet examples" ON)
-option(POLLNET_BUILD_TESTS "Build pollnet tests" ON)
-option(POLLNET_BUILD_BENCHMARKS "Build pollnet benchmarks" ON)
+option(POLLNET_BUILD_TESTS      "Build pollnet unit tests" ${POLLNET_IS_TOP_LEVEL})
+option(POLLNET_BUILD_EXAMPLES   "Build pollnet examples"   ${POLLNET_IS_TOP_LEVEL})
+option(POLLNET_BUILD_BENCHMARKS "Build pollnet benchmarks" ${POLLNET_IS_TOP_LEVEL})
 
+# Header-only C++20 interface target
 add_library(pollnet INTERFACE)
-target_include_directories(pollnet INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-)
+add_library(pollnet::pollnet ALIAS pollnet)
 target_compile_features(pollnet INTERFACE cxx_std_20)
+target_include_directories(pollnet INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 if(WIN32)
-    target_link_libraries(pollnet INTERFACE ws2_32)
+  target_link_libraries(pollnet INTERFACE ws2_32)
+endif()
+if(MSVC)
+  target_compile_options(pollnet INTERFACE /utf-8)
+endif()
+
+function(pollnet_add_executable target)
+  add_executable(${target} ${ARGN})
+  set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
+  target_link_libraries(${target} PRIVATE pollnet::pollnet)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4)
+  else()
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endfunction()
+
+if(POLLNET_BUILD_TESTS)
+  include(CTest)
+  enable_testing()
+  pollnet_add_executable(test_pollnet tests/test_pollnet.cpp)
+  add_test(NAME pollnet_tests COMMAND test_pollnet)
 endif()
 
 if(POLLNET_BUILD_EXAMPLES)
-    foreach(target tcp_server tcp_client udp_server udp_client)
-        add_executable(${target} examples/${target}.cpp)
-        target_link_libraries(${target} PRIVATE pollnet)
-        target_compile_options(${target} PRIVATE
-            $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>
-            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-        )
-    endforeach()
-endif()
-
-include(CTest)
-if(POLLNET_BUILD_TESTS AND BUILD_TESTING)
-    add_executable(test_pollnet tests/test_pollnet.cpp)
-    target_link_libraries(test_pollnet PRIVATE pollnet)
-    target_compile_options(test_pollnet PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
-    add_test(NAME pollnet_tests COMMAND test_pollnet)
+  foreach(name tcp_server tcp_client udp_server udp_client)
+    pollnet_add_executable(${name} examples/${name}.cpp)
+  endforeach()
 endif()
 
 if(POLLNET_BUILD_BENCHMARKS)
-    find_package(Threads REQUIRED)
-    add_executable(pollnet_bench benchmarks/bench.cpp)
-    target_include_directories(pollnet_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks)
-    target_link_libraries(pollnet_bench PRIVATE pollnet Threads::Threads)
-    target_compile_options(pollnet_bench PRIVATE
-        $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>
-        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
-    )
+  find_package(Threads REQUIRED)
+  pollnet_add_executable(pollnet_bench benchmarks/bench.cpp)
+  target_include_directories(pollnet_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks")
+  target_link_libraries(pollnet_bench PRIVATE Threads::Threads)
 endif()

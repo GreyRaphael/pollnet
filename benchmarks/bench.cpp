@@ -599,7 +599,7 @@ int main(int argc, char** argv) {
 
     if (!cfg.csv) {
         std::cout << std::format(
-            "=== pollnet v2.0.0 benchmark (warmup={}, iters={}, tp_iters={}, payload={}B, "
+            "=== pollnet v2.0.1 benchmark (warmup={}, iters={}, tp_iters={}, payload={}B, "
             "server_cpu={}, client_cpu={}) ===\n",
             cfg.warmup, cfg.iters, cfg.throughput_iters, cfg.payload, cfg.server_cpu,
             cfg.client_cpu);

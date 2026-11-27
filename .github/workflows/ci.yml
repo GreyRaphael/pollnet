@@ -2,44 +2,52 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
   pull_request:
-    branches: [ main, master ]
+    branches: [main]
 
 jobs:
   build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            compiler: gcc
+          - name: Linux GCC Release
+            os: ubuntu-latest
             cc: gcc
             cxx: g++
-          - os: ubuntu-latest
-            compiler: clang
+            build_type: Release
+            compiler: gcc
+          - name: Linux GCC Debug
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+            compiler: gcc
+          - name: Linux Clang Release
+            os: ubuntu-latest
             cc: clang
             cxx: clang++
-          - os: windows-latest
+            build_type: Release
+            compiler: clang
+          - name: Windows VS2022 Release
+            os: windows-2022
+            cc: ""
+            cxx: ""
+            build_type: Release
             compiler: msvc
-          - os: windows-latest
+          - name: Windows MinGW Debug
+            os: windows-latest
+            cc: ""
+            cxx: ""
+            build_type: Debug
             compiler: mingw
 
-    runs-on: ${{ matrix.os }}
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure (Linux)
-        if: runner.os == 'Linux'
-        env:
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-
-      - name: Configure (Windows MSVC)
-        if: matrix.compiler == 'msvc'
-        run: cmake -S . -B build
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup MinGW
         if: matrix.compiler == 'mingw'
@@ -51,33 +59,45 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
 
-      - name: Configure (Windows MinGW)
+      - name: Configure CMake
+        if: matrix.compiler != 'mingw'
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cc }}" ]; then
+            export CC="${{ matrix.cc }}"
+            export CXX="${{ matrix.cxx }}"
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Configure CMake (MinGW)
         if: matrix.compiler == 'mingw'
         shell: msys2 {0}
-        run: cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: cmake --build build -j
+      - name: Build
+        if: matrix.compiler != 'mingw'
+        shell: bash
+        run: cmake --build build --config ${{ matrix.build_type }} -j 4
 
-      - name: Build (Windows MSVC)
-        if: matrix.compiler == 'msvc'
-        run: cmake --build build --config Debug -j
-
-      - name: Build (Windows MinGW)
+      - name: Build (MinGW)
         if: matrix.compiler == 'mingw'
         shell: msys2 {0}
-        run: cmake --build build -j
+        run: cmake --build build -j 4
 
-      - name: Test (Linux)
-        if: runner.os == 'Linux'
+      - name: Run CTest
+        if: matrix.compiler != 'mingw'
+        shell: bash
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+      - name: Run CTest (MinGW)
+        if: matrix.compiler == 'mingw'
+        shell: msys2 {0}
         run: ctest --test-dir build --output-on-failure
 
-      - name: Test (Windows MSVC)
-        if: matrix.compiler == 'msvc'
-        run: ctest --test-dir build -C Debug --output-on-failure
-
-      - name: Test (Windows MinGW)
-        if: matrix.compiler == 'mingw'
-        shell: msys2 {0}
-        run: ctest --test-dir build --output-on-failure
+      - name: Standalone Compile Check (without CMake)
+        if: matrix.name == 'Linux GCC Release'
+        shell: bash
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude examples/tcp_server.cpp -o /tmp/standalone_tcp_server
+          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude tests/test_pollnet.cpp -o /tmp/standalone_test
+          /tmp/standalone_test
