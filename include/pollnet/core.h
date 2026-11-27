@@ -12,10 +12,14 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -23,6 +27,8 @@
 #include <cerrno>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <concepts>
 #include <cstddef>
@@ -37,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace pollnet {
 
@@ -145,12 +152,29 @@ inline void format_socket_error(char* buf, size_t buf_size, const char* msg, boo
 }  // namespace detail
 
 // ==========================================
-// 单调时钟与网络端点抽象 (Clock & Endpoint)
+// 单调时钟、线程绑核与网络端点抽象
 // ==========================================
 
 [[nodiscard]] inline int64_t now_ns() noexcept {
     using namespace std::chrono;
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// 将当前线程绑定到指定 CPU 核心；失败或平台不支持时返回 false
+inline bool pinThread(int cpu_id) noexcept {
+    if (cpu_id < 0) return false;
+#ifdef _WIN32
+    if (cpu_id >= static_cast<int>(sizeof(DWORD_PTR) * 8)) return false;
+    return ::SetThreadAffinityMask(::GetCurrentThread(), DWORD_PTR{1} << cpu_id) != 0;
+#elif defined(__linux__)
+    if (cpu_id >= CPU_SETSIZE) return false;
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu_id, &cpuset);
+    return ::sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0;
+#else
+    return false;
+#endif
 }
 
 struct Endpoint {
@@ -239,6 +263,18 @@ struct IoSlice {
         : data(std::ranges::data(range)), size(std::ranges::size(range)) {}
 };
 
+template <typename T>
+concept TriviallyCopyablePart = requires {
+    typename std::remove_cvref_t<T>;
+} && !std::same_as<std::remove_cvref_t<T>, IoSlice> && !ByteRange<std::remove_cvref_t<T>> &&
+    !std::ranges::range<std::remove_cvref_t<T>> && !std::is_pointer_v<std::remove_cvref_t<T>> &&
+    !std::is_array_v<std::remove_cvref_t<T>> &&
+    std::is_trivially_copyable_v<std::remove_cvref_t<T>>;
+
+template <typename T>
+concept SendPart = std::same_as<std::remove_cvref_t<T>, IoSlice> ||
+                   ByteRange<std::remove_cvref_t<T>> || TriviallyCopyablePart<T>;
+
 struct TcpClientOptions {
     std::string_view host{};
     uint16_t port = 0;
@@ -252,6 +288,20 @@ struct TcpClientOptions {
     int busy_poll_us = 0;
     int recv_buf_bytes = 0;
     int send_buf_bytes = 0;
+
+    [[nodiscard]] static constexpr TcpClientOptions lowLatency(std::string_view target_host,
+                                                               uint16_t target_port) noexcept {
+        TcpClientOptions opts{};
+        opts.host = target_host;
+        opts.port = target_port;
+        opts.retry_interval = std::chrono::milliseconds{1000};
+        opts.connect_timeout = std::chrono::milliseconds{3000};
+        opts.tcp_quickack = true;
+        opts.busy_poll_us = 50;
+        opts.recv_buf_bytes = 256 * 1024;
+        opts.send_buf_bytes = 256 * 1024;
+        return opts;
+    }
 };
 
 struct TcpServerOptions {
@@ -266,6 +316,20 @@ struct TcpServerOptions {
     int busy_poll_us = 0;
     int recv_buf_bytes = 0;
     int send_buf_bytes = 0;
+
+    [[nodiscard]] static constexpr TcpServerOptions lowLatency(std::string_view bind_host,
+                                                               uint16_t listen_port) noexcept {
+        TcpServerOptions opts{};
+        opts.host = bind_host;
+        opts.port = listen_port;
+        opts.backlog = 128;
+        opts.accept_poll_interval = 64;
+        opts.tcp_quickack = true;
+        opts.busy_poll_us = 50;
+        opts.recv_buf_bytes = 256 * 1024;
+        opts.send_buf_bytes = 256 * 1024;
+        return opts;
+    }
 };
 
 struct UdpOptions {
@@ -280,6 +344,31 @@ struct UdpOptions {
     int busy_poll_us = 0;
     int recv_buf_bytes = 0;
     int send_buf_bytes = 0;
+
+    [[nodiscard]] static constexpr UdpOptions lowLatencyRecv(
+        std::string_view bind_addr, uint16_t port, std::string_view mcast_group = {},
+        std::string_view mcast_iface = {}) noexcept {
+        UdpOptions opts{};
+        opts.bind_ip = bind_addr;
+        opts.bind_port = port;
+        opts.multicast_group_ip = mcast_group;
+        opts.multicast_interface_ip = mcast_iface;
+        opts.busy_poll_us = 50;
+        opts.recv_buf_bytes = 1024 * 1024;
+        return opts;
+    }
+
+    [[nodiscard]] static constexpr UdpOptions lowLatencySend(
+        std::string_view dest_addr, uint16_t port, uint16_t local_bind_port = 0) noexcept {
+        UdpOptions opts{};
+        opts.bind_ip = "0.0.0.0";
+        opts.bind_port = local_bind_port;
+        opts.dest_ip = dest_addr;
+        opts.dest_port = port;
+        opts.multicast_ttl = 1;
+        opts.send_buf_bytes = 256 * 1024;
+        return opts;
+    }
 };
 
 // ==========================================
@@ -334,6 +423,18 @@ template <typename H>
 concept UdpPacketHandler = std::invocable<H&, std::span<const uint8_t>, const Endpoint&>;
 
 namespace detail {
+
+template <SendPart T>
+[[nodiscard]] inline IoSlice make_io_slice(const T& part) noexcept {
+    using CleanT = std::remove_cvref_t<T>;
+    if constexpr (std::same_as<CleanT, IoSlice>) {
+        return part;
+    } else if constexpr (ByteRange<CleanT>) {
+        return IoSlice{part};
+    } else {
+        return IoSlice{&part, sizeof(CleanT)};
+    }
+}
 
 template <typename H, typename Conn>
 inline void dispatch_connect(H& h, Conn& conn) {
@@ -395,6 +496,174 @@ template <typename H>
     }
 }
 
+// 共享可选生命周期回调转发基类，避免在各个拆帧适配器中重复转发代码
+template <typename Handler>
+class HandlerForwarder {
+   public:
+    explicit HandlerForwarder(Handler& handler) noexcept : handler_(handler) {}
+
+    template <typename Conn>
+        requires HasOnConnect<Handler, Conn>
+    void onConnect(Conn& conn) {
+        handler_.onConnect(conn);
+    }
+
+    template <typename Conn>
+        requires HasOnDisconnect<Handler, Conn>
+    void onDisconnect(Conn& conn) {
+        handler_.onDisconnect(conn);
+    }
+
+    void onConnectFailed()
+        requires HasOnConnectFailed<Handler>
+    {
+        handler_.onConnectFailed();
+    }
+
+    template <typename Conn>
+        requires HasOnSendTimeout<Handler, Conn>
+    void onSendTimeout(Conn& conn) {
+        handler_.onSendTimeout(conn);
+    }
+
+    template <typename Conn>
+        requires HasOnRecvTimeout<Handler, Conn>
+    void onRecvTimeout(Conn& conn) {
+        handler_.onRecvTimeout(conn);
+    }
+
+    bool allowNewConnection(const Endpoint& ep)
+        requires HasAllowNewConnection<Handler>
+    {
+        return static_cast<bool>(handler_.allowNewConnection(ep));
+    }
+
+   protected:
+    Handler& handler_;
+};
+
 }  // namespace detail
+
+// ==========================================
+// 零开销编译期拆帧适配器 (Framers)
+// ==========================================
+
+template <typename MsgT, typename Handler>
+class FixedFrameHandler : public detail::HandlerForwarder<Handler> {
+    static_assert(std::is_trivially_copyable_v<MsgT> && sizeof(MsgT) > 0,
+                  "MsgT must be non-empty trivially copyable");
+
+   public:
+    explicit FixedFrameHandler(Handler& handler) noexcept
+        : detail::HandlerForwarder<Handler>(handler) {}
+
+    template <typename Conn>
+        requires requires(Handler& h, Conn& c, const MsgT& msg) { h.onMessage(c, msg); }
+    size_t onData(Conn& conn, std::span<const uint8_t> data) {
+        size_t offset = 0;
+        while (data.size() - offset >= sizeof(MsgT)) {
+            MsgT msg{};
+            std::memcpy(&msg, data.data() + offset, sizeof(MsgT));
+            this->handler_.onMessage(conn, msg);
+            if (!conn.isConnected()) {
+                return data.size();
+            }
+            offset += sizeof(MsgT);
+        }
+        return offset;
+    }
+};
+
+template <typename MsgT, typename Handler>
+[[nodiscard]] inline FixedFrameHandler<MsgT, Handler> makeFixedFrameHandler(Handler& handler) noexcept {
+    return FixedFrameHandler<MsgT, Handler>{handler};
+}
+
+template <typename HeaderT, typename LenFn, typename Handler>
+class LengthPrefixedHandler : public detail::HandlerForwarder<Handler> {
+    static_assert(std::is_trivially_copyable_v<HeaderT> && sizeof(HeaderT) > 0,
+                  "HeaderT must be non-empty trivially copyable");
+    static_assert(std::invocable<LenFn&, const HeaderT&>,
+                  "LenFn must be invocable with const HeaderT&");
+
+    using LenRet = std::remove_cvref_t<std::invoke_result_t<LenFn&, const HeaderT&>>;
+    static_assert(std::integral<LenRet>, "LenFn must return an integral body length");
+
+   public:
+    LengthPrefixedHandler(LenFn len_fn, Handler& handler, size_t max_body_len = 0) noexcept(
+        std::is_nothrow_move_constructible_v<LenFn>)
+        : detail::HandlerForwarder<Handler>(handler),
+          len_fn_(std::move(len_fn)),
+          max_body_len_(max_body_len) {}
+
+    template <typename Conn>
+        requires(
+            requires(Handler& h, Conn& c, const HeaderT& hdr, std::span<const uint8_t> body) {
+                h.onMessage(c, hdr, body);
+            } ||
+            requires(Handler& h, Conn& c, std::span<const uint8_t> body) {
+                h.onMessage(c, body);
+            })
+    size_t onData(Conn& conn, std::span<const uint8_t> data) {
+        size_t max_body = max_body_len_;
+        if constexpr (requires { Conn::kRecvBufSize; }) {
+            if constexpr (Conn::kRecvBufSize > sizeof(HeaderT)) {
+                constexpr size_t kCap = Conn::kRecvBufSize - sizeof(HeaderT);
+                max_body = (max_body == 0 || max_body > kCap) ? kCap : max_body;
+            } else {
+                max_body = 0;
+            }
+        } else if (max_body == 0) {
+            max_body = std::numeric_limits<size_t>::max() - sizeof(HeaderT);
+        }
+
+        size_t offset = 0;
+        while (data.size() - offset >= sizeof(HeaderT)) {
+            HeaderT hdr{};
+            std::memcpy(&hdr, data.data() + offset, sizeof(HeaderT));
+
+            LenRet raw_len = len_fn_(hdr);
+            if constexpr (std::signed_integral<LenRet>) {
+                if (raw_len < 0) {
+                    conn.close("invalid message length", false);
+                    return data.size();
+                }
+            }
+            size_t body_len = static_cast<size_t>(raw_len);
+            if (body_len > max_body) {
+                conn.close("message too large", false);
+                return data.size();
+            }
+
+            if (data.size() - offset - sizeof(HeaderT) < body_len) {
+                break;
+            }
+
+            std::span<const uint8_t> body{data.data() + offset + sizeof(HeaderT), body_len};
+            if constexpr (requires(Handler& h, Conn& c, const HeaderT& hd,
+                                   std::span<const uint8_t> b) { h.onMessage(c, hd, b); }) {
+                this->handler_.onMessage(conn, hdr, body);
+            } else {
+                this->handler_.onMessage(conn, body);
+            }
+            if (!conn.isConnected()) {
+                return data.size();
+            }
+            offset += sizeof(HeaderT) + body_len;
+        }
+        return offset;
+    }
+
+   private:
+    LenFn len_fn_;
+    size_t max_body_len_ = 0;
+};
+
+template <typename HeaderT, typename LenFn, typename Handler>
+[[nodiscard]] inline LengthPrefixedHandler<HeaderT, LenFn, Handler> makeLengthPrefixedHandler(
+    LenFn len_fn, Handler& handler, size_t max_body_len = 0)
+    noexcept(std::is_nothrow_move_constructible_v<LenFn>) {
+    return LengthPrefixedHandler<HeaderT, LenFn, Handler>{std::move(len_fn), handler, max_body_len};
+}
 
 }  // namespace pollnet

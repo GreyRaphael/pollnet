@@ -244,28 +244,133 @@ class TcpListener {
     char last_error_[128] = "";
 };
 
+// 可选编译期静态环形发送缓冲（SendBufSize == 0 时为空实现，零内存/分支开销）
+template <size_t Capacity>
+class StaticSendBuffer {
+   public:
+    [[nodiscard]] bool empty() const noexcept { return used_ == 0; }
+    [[nodiscard]] size_t size() const noexcept { return used_; }
+    [[nodiscard]] size_t free() const noexcept { return Capacity - used_; }
+
+    void clear() noexcept {
+        head_ = 0;
+        tail_ = 0;
+        used_ = 0;
+    }
+
+    [[nodiscard]] bool append(const void* data, size_t len) noexcept {
+        if (len == 0) return true;
+        if (!data || len > free()) return false;
+        size_t first = std::min(len, Capacity - tail_);
+        std::memcpy(buf_ + tail_, data, first);
+        if (len > first) {
+            std::memcpy(buf_, static_cast<const uint8_t*>(data) + first, len - first);
+        }
+        tail_ = (tail_ + len) % Capacity;
+        used_ += len;
+        return true;
+    }
+
+    [[nodiscard]] bool appendSlices(std::span<const IoSlice> slices, size_t skip_bytes) noexcept {
+        size_t total_rem = 0;
+        size_t skip = skip_bytes;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (!s.data) return false;
+            if (skip >= s.size) {
+                skip -= s.size;
+                continue;
+            }
+            size_t piece = s.size - skip;
+            skip = 0;
+            if (piece > free() - total_rem) return false;
+            total_rem += piece;
+        }
+        if (skip > 0 || total_rem > free()) return false;
+
+        skip = skip_bytes;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (skip >= s.size) {
+                skip -= s.size;
+                continue;
+            }
+            [[maybe_unused]] bool ok =
+                append(static_cast<const uint8_t*>(s.data) + skip, s.size - skip);
+            skip = 0;
+        }
+        return true;
+    }
+
+    [[nodiscard]] size_t peekSlices(std::array<IoSlice, 2>& out) const noexcept {
+        if (used_ == 0) return 0;
+        size_t first = std::min(used_, Capacity - head_);
+        out[0] = IoSlice{buf_ + head_, first};
+        if (used_ > first) {
+            out[1] = IoSlice{buf_, used_ - first};
+            return 2;
+        }
+        return 1;
+    }
+
+    void consume(size_t n) noexcept {
+        if (n >= used_) {
+            clear();
+            return;
+        }
+        head_ = (head_ + n) % Capacity;
+        used_ -= n;
+    }
+
+   private:
+    size_t head_ = 0;
+    size_t tail_ = 0;
+    size_t used_ = 0;
+    uint8_t buf_[Capacity];
+};
+
+template <>
+class StaticSendBuffer<0> {
+   public:
+    [[nodiscard]] constexpr bool empty() const noexcept { return true; }
+    [[nodiscard]] constexpr size_t size() const noexcept { return 0; }
+    [[nodiscard]] constexpr size_t free() const noexcept { return 0; }
+    void clear() noexcept {}
+    [[nodiscard]] constexpr bool append(const void*, size_t) noexcept { return false; }
+    [[nodiscard]] constexpr bool appendSlices(std::span<const IoSlice>, size_t) noexcept {
+        return false;
+    }
+    [[nodiscard]] constexpr size_t peekSlices(std::array<IoSlice, 2>&) const noexcept { return 0; }
+    void consume(size_t) noexcept {}
+};
+
 }  // namespace detail
 
 // ==========================================
 // TCP 后端实现 (Socket Backend - TCP)
 // ==========================================
 
-template <typename UserData, size_t RecvBufSize>
+template <typename UserData, size_t RecvBufSize, size_t SendBufSize>
 class SocketTcpClient;
 
-template <typename UserData, size_t RecvBufSize, size_t MaxConns>
+template <typename UserData, size_t RecvBufSize, size_t MaxConns, size_t SendBufSize>
 class SocketTcpServer;
 
-template <typename UserData, size_t RecvBufSize, size_t MaxConns>
+template <typename UserData, size_t RecvBufSize, size_t MaxConns, size_t SendBufSize>
 class EventLoopTcpServer;
 
-template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096>
+template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t SendBufSize = 0>
 class SocketTcpConnection : public UserData {
     static_assert(RecvBufSize > 0 &&
                       RecvBufSize <= static_cast<size_t>(std::numeric_limits<int>::max()),
                   "RecvBufSize must be in (0, INT_MAX]");
+    static_assert(SendBufSize <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                  "SendBufSize must be <= INT_MAX");
 
    public:
+    static constexpr size_t kRecvBufSize = RecvBufSize;
+    static constexpr size_t kSendBufSize = SendBufSize;
+
     SocketTcpConnection() = default;
     SocketTcpConnection(const SocketTcpConnection&) = delete;
     SocketTcpConnection& operator=(const SocketTcpConnection&) = delete;
@@ -276,6 +381,8 @@ class SocketTcpConnection : public UserData {
 
     [[nodiscard]] std::string_view lastError() const noexcept { return last_error_; }
     [[nodiscard]] bool isConnected() const noexcept { return fd_ != detail::INVALID_SOCKET_FD; }
+    [[nodiscard]] size_t pendingSendBytes() const noexcept { return send_buf_.size(); }
+    [[nodiscard]] size_t freeSendBytes() const noexcept { return send_buf_.free(); }
 
     [[nodiscard]] std::optional<Endpoint> peer() const noexcept {
         if (fd_ == detail::INVALID_SOCKET_FD) return std::nullopt;
@@ -293,11 +400,253 @@ class SocketTcpConnection : public UserData {
             detail::close_socket(fd_);
             fd_ = detail::INVALID_SOCKET_FD;
         }
+        send_buf_.clear();
+    }
+
+    // 尝试将静态发送缓冲中积压的数据刷新到内核；遇到 EAGAIN 返回 true，仅在致命 socket 错误时返回 false
+    bool flushSendBuffer() noexcept {
+        if constexpr (SendBufSize == 0) {
+            return isConnected();
+        } else {
+            if (fd_ == detail::INVALID_SOCKET_FD) return false;
+            while (!send_buf_.empty()) {
+                std::array<IoSlice, 2> parts{};
+                size_t cnt = send_buf_.peekSlices(parts);
+                int sent = writeSomeRaw(std::span<const IoSlice>{parts.data(), cnt}, false);
+                if (sent < 0) return false;
+                if (sent == 0) break;
+                send_buf_.consume(static_cast<size_t>(sent));
+            }
+            return true;
+        }
     }
 
     [[nodiscard]] int writeSome(const void* data, size_t size, bool more = false) noexcept {
+        if constexpr (SendBufSize > 0) {
+            if (!send_buf_.empty()) {
+                if (!flushSendBuffer()) return -1;
+                if (!send_buf_.empty()) return 0;
+            }
+        }
+        return writeSomeRaw(data, size, more);
+    }
+
+    [[nodiscard]] int writeSome(IoSlice slice, bool more = false) noexcept {
+        return writeSome(slice.data, slice.size, more);
+    }
+
+    [[nodiscard]] int writeSome(std::span<const IoSlice> slices, bool more = false) noexcept {
+        if constexpr (SendBufSize > 0) {
+            if (!send_buf_.empty()) {
+                if (!flushSendBuffer()) return -1;
+                if (!send_buf_.empty()) return 0;
+            }
+        }
+        return writeSomeRaw(slices, more);
+    }
+
+    [[nodiscard]] bool writeNonblock(const void* data, size_t size, bool more = false) noexcept {
+        if (size == 0) return isConnected();
+        if (!data) {
+            close("invalid send buffer", false);
+            return false;
+        }
+        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            close("send size overflow", false);
+            return false;
+        }
+        if constexpr (SendBufSize == 0) {
+            int sent = writeSomeRaw(data, size, more);
+            if (sent < 0) return false;
+            if (static_cast<size_t>(sent) != size) {
+                close("send buffer full", false);
+                return false;
+            }
+            return true;
+        } else {
+            if (fd_ == detail::INVALID_SOCKET_FD) return false;
+            if (!send_buf_.empty()) {
+                if (!flushSendBuffer()) return false;
+                if (!send_buf_.empty()) {
+                    if (size > send_buf_.free()) return false;
+                    [[maybe_unused]] bool ok = send_buf_.append(data, size);
+                    return true;
+                }
+            }
+            int sent = writeSomeRaw(data, size, more);
+            if (sent < 0) return false;
+            size_t rem = size - static_cast<size_t>(sent);
+            if (rem == 0) return true;
+            if (rem <= send_buf_.free()) {
+                [[maybe_unused]] bool ok =
+                    send_buf_.append(static_cast<const uint8_t*>(data) + sent, rem);
+                return true;
+            }
+            if (sent == 0) return false;
+            close("send buffer full", false);
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool writeNonblock(IoSlice slice, bool more = false) noexcept {
+        return writeNonblock(slice.data, slice.size, more);
+    }
+
+    [[nodiscard]] bool writeNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
+        constexpr size_t kMaxIov = 64;
+        size_t total_bytes = 0;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (!s.data) {
+                close("invalid io slice", false);
+                return false;
+            }
+            if (s.size > static_cast<size_t>(std::numeric_limits<int>::max()) - total_bytes) {
+                close("send size overflow", false);
+                return false;
+            }
+            total_bytes += s.size;
+        }
+        if (total_bytes == 0) return isConnected();
+
+        if constexpr (SendBufSize > 0) {
+            if (fd_ == detail::INVALID_SOCKET_FD) return false;
+            if (!send_buf_.empty()) {
+                if (!flushSendBuffer()) return false;
+                if (!send_buf_.empty()) {
+                    if (total_bytes > send_buf_.free()) return false;
+                    [[maybe_unused]] bool ok = send_buf_.appendSlices(slices, 0);
+                    return true;
+                }
+            }
+        }
+
+        size_t offset = 0;
+        size_t total_sent = 0;
+        while (offset < slices.size()) {
+            size_t count = std::min(kMaxIov, slices.size() - offset);
+            size_t chunk_bytes = 0;
+            for (size_t i = 0; i < count; ++i) chunk_bytes += slices[offset + i].size;
+            bool chunk_more = more || (offset + count < slices.size());
+            int sent = writeSomeRaw(slices.subspan(offset, count), chunk_more);
+            if (sent < 0) return false;
+            total_sent += static_cast<size_t>(sent);
+            if (static_cast<size_t>(sent) != chunk_bytes) {
+                if constexpr (SendBufSize > 0) {
+                    size_t rem = total_bytes - total_sent;
+                    if (rem <= send_buf_.free()) {
+                        [[maybe_unused]] bool ok = send_buf_.appendSlices(slices, total_sent);
+                        return true;
+                    }
+                    if (total_sent == 0) return false;
+                }
+                close("send buffer full", false);
+                return false;
+            }
+            offset += count;
+        }
+        return true;
+    }
+
+    template <SendPart... Parts>
+        requires(sizeof...(Parts) > 0)
+    [[nodiscard]] bool sendParts(const Parts&... parts) noexcept {
+        std::array<IoSlice, sizeof...(Parts)> slices{detail::make_io_slice(parts)...};
+        return writeNonblock(std::span<const IoSlice>{slices});
+    }
+
+    [[nodiscard]] bool write(const void* data_, size_t size, bool more = false) noexcept {
+        if (size == 0) return isConnected();
+        if constexpr (SendBufSize > 0) {
+            while (!send_buf_.empty()) {
+                if (!flushSendBuffer()) return false;
+            }
+        }
+        const uint8_t* data = static_cast<const uint8_t*>(data_);
+        do {
+            int sent = writeSomeRaw(data, size, more);
+            if (sent < 0) return false;
+            data += sent;
+            size -= static_cast<size_t>(sent);
+        } while (size != 0);
+        return true;
+    }
+
+    [[nodiscard]] bool write(IoSlice slice, bool more = false) noexcept {
+        return write(slice.data, slice.size, more);
+    }
+
+    [[nodiscard]] bool write(std::span<const IoSlice> slices, bool more = false) noexcept {
+        constexpr size_t kMaxIov = 64;
+        size_t total_bytes = 0;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (!s.data) {
+                close("invalid io slice", false);
+                return false;
+            }
+            total_bytes += s.size;
+        }
+        if (total_bytes == 0) return isConnected();
+
+        if constexpr (SendBufSize > 0) {
+            while (!send_buf_.empty()) {
+                if (!flushSendBuffer()) return false;
+            }
+        }
+
+        size_t idx = 0;
+        size_t slice_off = 0;
+        while (idx < slices.size()) {
+            std::array<IoSlice, kMaxIov> cur{};
+            size_t cnt = 0;
+            for (size_t i = idx; i < slices.size() && cnt < kMaxIov; ++i) {
+                size_t off = (i == idx) ? slice_off : 0;
+                if (slices[i].size <= off) continue;
+                cur[cnt++] = IoSlice{static_cast<const uint8_t*>(slices[i].data) + off,
+                                     slices[i].size - off};
+            }
+            if (cnt == 0) break;
+
+            int sent = writeSomeRaw(std::span<const IoSlice>{cur.data(), cnt}, more);
+            if (sent < 0) return false;
+            size_t adv = static_cast<size_t>(sent);
+            while (adv > 0 && idx < slices.size()) {
+                size_t avail = slices[idx].size - slice_off;
+                if (adv < avail) {
+                    slice_off += adv;
+                    adv = 0;
+                } else {
+                    adv -= avail;
+                    ++idx;
+                    slice_off = 0;
+                }
+            }
+            while (idx < slices.size() && slices[idx].size == 0) {
+                ++idx;
+                slice_off = 0;
+            }
+        }
+        return true;
+    }
+
+   protected:
+    template <typename, size_t, size_t>
+    friend class SocketTcpClient;
+
+    template <typename, size_t, size_t, size_t>
+    friend class SocketTcpServer;
+
+    template <typename, size_t, size_t, size_t>
+    friend class EventLoopTcpServer;
+
+    [[nodiscard]] int writeSomeRaw(const void* data, size_t size, bool more = false) noexcept {
         if (fd_ == detail::INVALID_SOCKET_FD) return -1;
         if (size == 0) return 0;
+        if (!data) {
+            close("invalid send buffer", false);
+            return -1;
+        }
         if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
             close("send size overflow", false);
             return -1;
@@ -327,11 +676,7 @@ class SocketTcpConnection : public UserData {
         return ret;
     }
 
-    [[nodiscard]] int writeSome(IoSlice slice, bool more = false) noexcept {
-        return writeSome(slice.data, slice.size, more);
-    }
-
-    [[nodiscard]] int writeSome(std::span<const IoSlice> slices, bool more = false) noexcept {
+    [[nodiscard]] int writeSomeRaw(std::span<const IoSlice> slices, bool more = false) noexcept {
         if (fd_ == detail::INVALID_SOCKET_FD) return -1;
         if (slices.empty()) return 0;
 
@@ -417,145 +762,11 @@ class SocketTcpConnection : public UserData {
 #endif
     }
 
-    [[nodiscard]] bool writeNonblock(const void* data, size_t size, bool more = false) noexcept {
-        if (size == 0) return isConnected();
-        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-            close("send size overflow", false);
-            return false;
-        }
-        int sent = writeSome(data, size, more);
-        if (sent < 0) return false;
-        if (static_cast<size_t>(sent) != size) {
-            close("send buffer full", false);
-            return false;
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool writeNonblock(IoSlice slice, bool more = false) noexcept {
-        return writeNonblock(slice.data, slice.size, more);
-    }
-
-    [[nodiscard]] bool writeNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
-        constexpr size_t kMaxIov = 64;
-        size_t total_bytes = 0;
-        for (const auto& s : slices) {
-            if (s.size == 0) continue;
-            if (!s.data) {
-                close("invalid io slice", false);
-                return false;
-            }
-            if (s.size > static_cast<size_t>(std::numeric_limits<int>::max()) - total_bytes) {
-                close("send size overflow", false);
-                return false;
-            }
-            total_bytes += s.size;
-        }
-        if (total_bytes == 0) return isConnected();
-
-        if (slices.size() <= kMaxIov) {
-            int sent = writeSome(slices, more);
-            if (sent < 0) return false;
-            if (static_cast<size_t>(sent) != total_bytes) {
-                close("send buffer full", false);
-                return false;
-            }
-            return true;
-        }
-
-        size_t offset = 0;
-        while (offset < slices.size()) {
-            size_t count = std::min(kMaxIov, slices.size() - offset);
-            size_t chunk_bytes = 0;
-            for (size_t i = 0; i < count; ++i) chunk_bytes += slices[offset + i].size;
-            bool chunk_more = more || (offset + count < slices.size());
-            int sent = writeSome(slices.subspan(offset, count), chunk_more);
-            if (sent < 0) return false;
-            if (static_cast<size_t>(sent) != chunk_bytes) {
-                close("send buffer full", false);
-                return false;
-            }
-            offset += count;
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool write(const void* data_, size_t size, bool more = false) noexcept {
-        if (size == 0) return isConnected();
-        const uint8_t* data = static_cast<const uint8_t*>(data_);
-        do {
-            int sent = writeSome(data, size, more);
-            if (sent < 0) return false;
-            data += sent;
-            size -= static_cast<size_t>(sent);
-        } while (size != 0);
-        return true;
-    }
-
-    [[nodiscard]] bool write(IoSlice slice, bool more = false) noexcept {
-        return write(slice.data, slice.size, more);
-    }
-
-    [[nodiscard]] bool write(std::span<const IoSlice> slices, bool more = false) noexcept {
-        constexpr size_t kMaxIov = 64;
-        size_t total_bytes = 0;
-        for (const auto& s : slices) {
-            if (s.size == 0) continue;
-            if (!s.data) {
-                close("invalid io slice", false);
-                return false;
-            }
-            total_bytes += s.size;
-        }
-        if (total_bytes == 0) return isConnected();
-
-        size_t idx = 0;
-        size_t slice_off = 0;
-        while (idx < slices.size()) {
-            std::array<IoSlice, kMaxIov> cur{};
-            size_t cnt = 0;
-            for (size_t i = idx; i < slices.size() && cnt < kMaxIov; ++i) {
-                size_t off = (i == idx) ? slice_off : 0;
-                if (slices[i].size <= off) continue;
-                cur[cnt++] = IoSlice{static_cast<const uint8_t*>(slices[i].data) + off,
-                                     slices[i].size - off};
-            }
-            if (cnt == 0) break;
-
-            int sent = writeSome(std::span<const IoSlice>{cur.data(), cnt}, more);
-            if (sent < 0) return false;
-            size_t adv = static_cast<size_t>(sent);
-            while (adv > 0 && idx < slices.size()) {
-                size_t avail = slices[idx].size - slice_off;
-                if (adv < avail) {
-                    slice_off += adv;
-                    adv = 0;
-                } else {
-                    adv -= avail;
-                    ++idx;
-                    slice_off = 0;
-                }
-            }
-            while (idx < slices.size() && slices[idx].size == 0) {
-                ++idx;
-                slice_off = 0;
-            }
-        }
-        return true;
-    }
-
-   protected:
-    template <typename, size_t>
-    friend class SocketTcpClient;
-
-    template <typename, size_t, size_t>
-    friend class SocketTcpServer;
-
-    template <typename, size_t, size_t>
-    friend class EventLoopTcpServer;
-
     template <typename Handler>
     void pollConn(int64_t now, Handler& handler) {
+        if constexpr (SendBufSize > 0) {
+            if (!flushSendBuffer()) return;
+        }
         if (send_timeout_ns_ > 0 && now - send_ts_ >= send_timeout_ns_) {
             detail::dispatch_send_timeout(handler, *this);
             send_ts_ = now;
@@ -638,6 +849,7 @@ class SocketTcpConnection : public UserData {
               int busy_poll_us = 0) noexcept {
         fd_ = fd;
         head_ = tail_ = 0;
+        send_buf_.clear();
         send_ts_ = now;
         recv_ts_ = now;
         send_timeout_ns_ = send_timeout_ns;
@@ -674,13 +886,14 @@ class SocketTcpConnection : public UserData {
     int64_t recv_timeout_ns_ = 0;
     bool tcp_quickack_ = false;
     uint8_t recvbuf_[RecvBufSize];
+    [[no_unique_address]] detail::StaticSendBuffer<SendBufSize> send_buf_;
     char last_error_[128] = "";
 };
 
-template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096>
+template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t SendBufSize = 0>
 class SocketTcpClient {
    public:
-    using Conn = SocketTcpConnection<UserData, RecvBufSize>;
+    using Conn = SocketTcpConnection<UserData, RecvBufSize, SendBufSize>;
 
     SocketTcpClient() = default;
     SocketTcpClient(const SocketTcpClient&) = delete;
@@ -747,6 +960,9 @@ class SocketTcpClient {
     [[nodiscard]] bool isConnected() const noexcept { return conn_.isConnected(); }
     [[nodiscard]] std::string_view lastError() const noexcept { return conn_.lastError(); }
     [[nodiscard]] std::optional<Endpoint> peer() const noexcept { return conn_.peer(); }
+    [[nodiscard]] size_t pendingSendBytes() const noexcept { return conn_.pendingSendBytes(); }
+    [[nodiscard]] size_t freeSendBytes() const noexcept { return conn_.freeSendBytes(); }
+    bool flushSendBuffer() noexcept { return conn_.flushSendBuffer(); }
 
     [[nodiscard]] int writeSome(const void* data, size_t size, bool more = false) noexcept {
         return conn_.writeSome(data, size, more);
@@ -766,6 +982,12 @@ class SocketTcpClient {
     }
     [[nodiscard]] bool writeNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
         return conn_.writeNonblock(slices, more);
+    }
+
+    template <SendPart... Parts>
+        requires(sizeof...(Parts) > 0)
+    [[nodiscard]] bool sendParts(const Parts&... parts) noexcept {
+        return conn_.sendParts(parts...);
     }
 
     [[nodiscard]] bool write(const void* data, size_t size, bool more = false) noexcept {
@@ -913,12 +1135,13 @@ class SocketTcpClient {
     int send_buf_bytes_ = 0;
 };
 
-template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t MaxConns = 64>
+template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t MaxConns = 64,
+          size_t SendBufSize = 0>
 class SocketTcpServer {
     static_assert(MaxConns > 0, "MaxConns must be > 0");
 
    public:
-    using Conn = SocketTcpConnection<UserData, RecvBufSize>;
+    using Conn = SocketTcpConnection<UserData, RecvBufSize, SendBufSize>;
 
     SocketTcpServer() noexcept {
         for (size_t i = 0; i < MaxConns; i++) conns_[i] = conns_data_ + i;
@@ -1260,6 +1483,41 @@ class SocketUdpSocket {
         return recvBatchImpl<MaxBatch, true>(handler);
     }
 
+    template <TriviallyCopyablePart T>
+    [[nodiscard]] bool sendStruct(const T& pkt) noexcept {
+        return send(&pkt, sizeof(T));
+    }
+
+    template <TriviallyCopyablePart T>
+    [[nodiscard]] bool sendStructTo(const T& pkt, const Endpoint& dst) noexcept {
+        return sendTo(&pkt, sizeof(T), dst);
+    }
+
+    template <typename T, typename Handler>
+        requires(TriviallyCopyablePart<T> && sizeof(T) <= RecvBufSize &&
+                 (std::invocable<Handler&, const T&> ||
+                  std::invocable<Handler&, const T&, const Endpoint&>))
+    [[nodiscard]] bool recvStruct(Handler handler) {
+        bool parsed = false;
+        auto decode = [&](std::span<const uint8_t> data, auto&& invoke) {
+            if (data.size() != sizeof(T)) return;
+            T pkt{};
+            std::memcpy(&pkt, data.data(), sizeof(T));
+            invoke(pkt);
+            parsed = true;
+        };
+        if constexpr (std::invocable<Handler&, const T&, const Endpoint&>) {
+            (void)recvFrom([&](std::span<const uint8_t> data, const Endpoint& peer) {
+                decode(data, [&](const T& pkt) { handler(pkt, peer); });
+            });
+        } else {
+            (void)recv([&](std::span<const uint8_t> data) {
+                decode(data, [&](const T& pkt) { handler(pkt); });
+            });
+        }
+        return parsed;
+    }
+
    private:
     [[nodiscard]] size_t sendBatchImpl(std::span<const IoSlice> packets,
                                        const Endpoint* dst) noexcept {
@@ -1373,14 +1631,15 @@ class SocketUdpSocket {
 // 默认便捷别名 (Default Aliases)
 // ==========================================
 
-template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096>
-using TcpConnection = SocketTcpConnection<UserData, RecvBufSize>;
+template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t SendBufSize = 0>
+using TcpConnection = SocketTcpConnection<UserData, RecvBufSize, SendBufSize>;
 
-template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096>
-using TcpClient = SocketTcpClient<UserData, RecvBufSize>;
+template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t SendBufSize = 0>
+using TcpClient = SocketTcpClient<UserData, RecvBufSize, SendBufSize>;
 
-template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t MaxConns = 64>
-using TcpServer = SocketTcpServer<UserData, RecvBufSize, MaxConns>;
+template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t MaxConns = 64,
+          size_t SendBufSize = 0>
+using TcpServer = SocketTcpServer<UserData, RecvBufSize, MaxConns, SendBufSize>;
 
 template <size_t RecvBufSize = 1500>
 using UdpSocket = SocketUdpSocket<RecvBufSize>;

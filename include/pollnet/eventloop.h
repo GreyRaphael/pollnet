@@ -16,14 +16,34 @@
 
 namespace pollnet {
 
-template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t MaxConns = 64>
+#ifdef __linux__
+namespace detail {
+template <size_t MaxConns, bool Enable>
+struct WriteInterestState {
+    [[nodiscard]] constexpr bool get(size_t) const noexcept { return false; }
+    constexpr void set(size_t, bool) noexcept {}
+    constexpr void reset() noexcept {}
+};
+
+template <size_t MaxConns>
+struct WriteInterestState<MaxConns, true> {
+    [[nodiscard]] bool get(size_t slot) const noexcept { return armed_[slot]; }
+    void set(size_t slot, bool v) noexcept { armed_[slot] = v; }
+    void reset() noexcept { armed_.fill(false); }
+    std::array<bool, MaxConns> armed_{};
+};
+}  // namespace detail
+#endif
+
+template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t MaxConns = 64,
+          size_t SendBufSize = 0>
 class EventLoopTcpServer {
     static_assert(MaxConns > 0, "MaxConns must be > 0");
     static_assert(MaxConns <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - 1,
                   "MaxConns exceeds uint32_t token range");
 
    public:
-    using Conn = SocketTcpConnection<UserData, RecvBufSize>;
+    using Conn = SocketTcpConnection<UserData, RecvBufSize, SendBufSize>;
 
     EventLoopTcpServer() noexcept { resetSlots(); }
     EventLoopTcpServer(const EventLoopTcpServer&) = delete;
@@ -111,6 +131,11 @@ class EventLoopTcpServer {
     void pollImpl(Handler& handler, int timeout_ms, bool use_sys_clock, int64_t now) {
         if (listener_.isClosed() && active_cnt_ == 0) return;
 
+        if constexpr (SendBufSize > 0) {
+            flushPendingWrites(handler);
+            if (listener_.isClosed() && active_cnt_ == 0) return;
+        }
+
 #ifdef __linux__
         if (epoll_fd_ < 0) return;
         constexpr size_t kMaxEvents = (MaxConns + 1 < 128) ? (MaxConns + 1) : 128;
@@ -132,15 +157,20 @@ class EventLoopTcpServer {
                 acceptReady(handler, now);
                 continue;
             }
-            handleActiveSlot(handler, static_cast<size_t>(token), (ev_mask & EPOLLERR) != 0, now);
+            bool can_write = (ev_mask & EPOLLOUT) != 0;
+            bool can_read = (ev_mask & ~uint32_t{EPOLLOUT}) != 0;
+            bool has_err = (ev_mask & EPOLLERR) != 0;
+            handleActiveSlot(handler, static_cast<size_t>(token), can_read, can_write, has_err, now);
         }
 #else
 #ifdef _WIN32
         using pollfd_t = WSAPOLLFD;
         constexpr short kPollRead = POLLRDNORM;
+        constexpr short kPollWrite = POLLWRNORM;
 #else
         using pollfd_t = struct pollfd;
         constexpr short kPollRead = POLLIN;
+        constexpr short kPollWrite = POLLOUT;
 #endif
         std::array<pollfd_t, MaxConns + 1> pfds{};
         std::array<uint32_t, MaxConns + 1> tokens{};
@@ -155,8 +185,14 @@ class EventLoopTcpServer {
         }
         for (size_t i = 0; i < active_cnt_; ++i) {
             size_t slot = active_slots_[i];
+            short ev = kPollRead;
+            if constexpr (SendBufSize > 0) {
+                if (conns_data_[slot].pendingSendBytes() > 0) {
+                    ev |= kPollWrite;
+                }
+            }
             pfds[nfds].fd = conns_data_[slot].fd_;
-            pfds[nfds].events = kPollRead;
+            pfds[nfds].events = ev;
             pfds[nfds].revents = 0;
             tokens[nfds] = static_cast<uint32_t>(slot);
             ++nfds;
@@ -185,7 +221,11 @@ class EventLoopTcpServer {
                     acceptReady(handler, now);
                     continue;
                 }
-                handleActiveSlot(handler, static_cast<size_t>(token), (rev & POLLERR) != 0, now);
+                bool can_write = (rev & kPollWrite) != 0;
+                bool can_read = (rev & static_cast<short>(~kPollWrite)) != 0;
+                bool has_err = (rev & POLLERR) != 0;
+                handleActiveSlot(handler, static_cast<size_t>(token), can_read, can_write, has_err,
+                                 now);
             }
         }
 #endif
@@ -206,6 +246,9 @@ class EventLoopTcpServer {
             active_slots_[i] = 0;
             slot_active_[i] = false;
         }
+#ifdef __linux__
+        write_armed_.reset();
+#endif
     }
 
     void closeAllConnections(const char* reason) noexcept {
@@ -231,17 +274,68 @@ class EventLoopTcpServer {
         }
         return true;
     }
+
+    [[nodiscard]] bool updateWriteInterest(size_t slot, bool want_write) noexcept {
+        if (epoll_fd_ < 0 || slot >= MaxConns || !slot_active_[slot]) return true;
+        if (write_armed_.get(slot) == want_write) return true;
+        struct epoll_event ev{};
+        ev.events = want_write ? (EPOLLIN | EPOLLOUT) : EPOLLIN;
+        ev.data.u32 = static_cast<uint32_t>(slot);
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conns_data_[slot].fd_, &ev) < 0) {
+            return false;
+        }
+        write_armed_.set(slot, want_write);
+        return true;
+    }
 #endif
 
     template <typename Handler>
-    void handleActiveSlot(Handler& handler, size_t slot, bool has_err, int64_t now) {
+    void flushPendingWrites(Handler& handler) {
+        for (size_t i = active_cnt_; i > 0; --i) {
+            size_t slot = active_slots_[i - 1];
+            Conn& c = conns_data_[slot];
+            if (c.pendingSendBytes() > 0) {
+                (void)c.flushSendBuffer();
+                if (!c.isConnected()) {
+                    releaseSlot(slot);
+                    detail::dispatch_disconnect(handler, c);
+                    continue;
+                }
+            }
+#ifdef __linux__
+            if (!updateWriteInterest(slot, c.pendingSendBytes() > 0)) {
+                c.close("epoll_ctl mod error", true);
+                releaseSlot(slot);
+                detail::dispatch_disconnect(handler, c);
+            }
+#endif
+        }
+    }
+
+    template <typename Handler>
+    void handleActiveSlot(Handler& handler, size_t slot, bool can_read, bool can_write, bool has_err,
+                          int64_t now) {
         if (slot >= MaxConns || !slot_active_[slot]) return;
         Conn& c = conns_data_[slot];
-        bool got_data = c.read([&](std::span<const uint8_t> buf) {
-            return static_cast<size_t>(handler.onData(c, buf));
-        });
-        if (got_data && recv_timeout_ns_ > 0) {
-            c.recv_ts_ = now;
+        if constexpr (SendBufSize > 0) {
+            if (can_write && c.pendingSendBytes() > 0) {
+                (void)c.flushSendBuffer();
+#ifdef __linux__
+                if (c.isConnected() && c.pendingSendBytes() == 0) {
+                    (void)updateWriteInterest(slot, false);
+                }
+#endif
+            }
+        } else {
+            (void)can_write;
+        }
+        if (c.isConnected() && can_read) {
+            bool got_data = c.read([&](std::span<const uint8_t> buf) {
+                return static_cast<size_t>(handler.onData(c, buf));
+            });
+            if (got_data && recv_timeout_ns_ > 0) {
+                c.recv_ts_ = now;
+            }
         }
         if (c.isConnected() && has_err) {
             c.close("eventloop error", false);
@@ -283,6 +377,9 @@ class EventLoopTcpServer {
 
             --free_top_;
             slot_active_[slot] = true;
+#ifdef __linux__
+            write_armed_.set(slot, false);
+#endif
             active_pos_[slot] = active_cnt_;
             active_slots_[active_cnt_++] = slot;
             detail::dispatch_connect(handler, c);
@@ -297,6 +394,9 @@ class EventLoopTcpServer {
     void releaseSlot(size_t slot) noexcept {
         if (!slot_active_[slot]) return;
         slot_active_[slot] = false;
+#ifdef __linux__
+        write_armed_.set(slot, false);
+#endif
         size_t pos = active_pos_[slot];
         size_t last_slot = active_slots_[--active_cnt_];
         if (pos != active_cnt_) {
@@ -348,6 +448,9 @@ class EventLoopTcpServer {
     size_t active_pos_[MaxConns]{};
     size_t free_slots_[MaxConns]{};
     bool slot_active_[MaxConns]{};
+#ifdef __linux__
+    [[no_unique_address]] detail::WriteInterestState<MaxConns, (SendBufSize > 0)> write_armed_;
+#endif
     Conn conns_data_[MaxConns];
 };
 

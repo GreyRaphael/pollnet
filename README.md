@@ -5,11 +5,11 @@
 ## 特性
 
 - **精简三层模块化设计（Linux + Windows 全平台一致）**：
-  - [core.h](include/pollnet/core.h)：后端无关核心（`Endpoint`、`ByteRange`/`IoSlice`、`Options`、`Concepts`、零开销可选回调分发）。
-  - [socket.h](include/pollnet/socket.h)：标准轮询后端（`TcpClient` / `TcpServer` / 统一 `UdpSocket`；支持 `accept` 节流、向量写 `IoSlice` 批写、Linux `sendmmsg`/`recvmmsg` UDP 批量收发与低延迟内核调优参数）。
-  - [eventloop.h](include/pollnet/eventloop.h)：跨平台事件循环后端 `EventLoopTcpServer`（Linux `epoll` / Windows `WSAPoll` / 通用 POSIX `poll`），在多连接场景实现 $O(\text{active})$ 派发。
-- **现代 C++20 API**：指定初始化器 `Options` 结构体、`std::chrono::milliseconds` 亚秒级超时、`std::span`/`ByteRange` 零拷贝视图与编译期 `if constexpr` 可选回调（仅 `onData` 必选）。
-- **零堆分配与资源安全**：连接池与接收缓冲区全部预分配，所有 Socket 类遵循 Rule of Five 禁止误拷贝/移动。
+  - [core.h](include/pollnet/core.h)：后端无关核心（`Endpoint`、`pinThread`、`ByteRange`/`IoSlice`、`SendPart`、`Options` 及 `lowLatency*` 预设、`Concepts`、零开销 `FixedFrameHandler`/`LengthPrefixedHandler` 拆帧器）。
+  - [socket.h](include/pollnet/socket.h)：标准轮询后端（`TcpClient` / `TcpServer` / 统一 `UdpSocket`；支持可选零开销/静态环形发送缓冲 `SendBufSize`、可变参聚集写 `sendParts`、`accept` 节流、Linux `sendmmsg`/`recvmmsg` UDP 批量收发与 `sendStruct`/`recvStruct`）。
+  - [eventloop.h](include/pollnet/eventloop.h)：跨平台事件循环后端 `EventLoopTcpServer`（Linux `epoll` / Windows `WSAPoll` / 通用 POSIX `poll`），支持多连接 $O(\text{active})$ 派发与可选 `SendBufSize` 可写事件续发。
+- **现代 C++20 API**：指定初始化器 `Options` 结构体与 `lowLatency` 预设、`std::chrono::milliseconds` 亚秒级超时、`std::span`/`ByteRange` 零拷贝视图与编译期 `if constexpr` 可选回调（仅 `onData` 必选）。
+- **零堆分配与资源安全**：连接池、接收缓冲区及可选发送缓冲区全部静态预分配，所有 Socket 类遵循 Rule of Five 禁止误拷贝/移动。
 
 ## 快速示例
 
@@ -35,6 +35,26 @@ int main() {
     EchoHandler handler;
     while (true) server.poll(handler);
 }
+```
+
+### 进阶：低延迟预设、拆帧器与静态发送缓冲
+
+```cpp
+// 绑定 CPU 核心，启用 64KiB 静态发送缓冲（遇 EAGAIN 自动入队并在 poll 中续发）
+pollnet::pinThread(2);
+pollnet::TcpServer<pollnet::EmptyUserData, 4096, 64, 65536> server;
+server.listen(pollnet::TcpServerOptions::lowLatency("127.0.0.1", 1234));
+
+struct MsgHdr { uint32_t len_be; };
+struct HftHandler {
+    void onMessage(decltype(server)::Conn& conn, const MsgHdr& hdr, std::span<const uint8_t> body) {
+        (void)conn.sendParts(hdr, body);  // 零拼包聚集写，自动兼容 ByteRange 与 POD 结构体
+    }
+} hft;
+
+auto framed = pollnet::makeLengthPrefixedHandler<MsgHdr>(
+    [](const MsgHdr& h) { return ntohl(h.len_be); }, hft);
+while (true) server.poll(framed);
 ```
 
 ## 集成到其他项目

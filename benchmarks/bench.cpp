@@ -18,11 +18,11 @@
 
 namespace {
 
-template <template <typename, size_t, size_t> class ServerT, bool UseExtClock = false,
+template <template <typename, size_t, size_t, size_t> class ServerT, bool UseExtClock = false,
           bool PassTimeoutArg = false>
 bool run_tcp_ping_pong_server(const pollnet_bench::BenchConfig& cfg, std::string_view label,
                               bool quickack = false) {
-    using Server = ServerT<pollnet::EmptyUserData, 4096, 4>;
+    using Server = ServerT<pollnet::EmptyUserData, 4096, 4, 0>;
     using Client = pollnet::TcpClient<pollnet::EmptyUserData, 4096>;
 
     std::atomic<uint16_t> port{0};
@@ -144,10 +144,10 @@ bool run_tcp_ping_pong_server(const pollnet_bench::BenchConfig& cfg, std::string
     return true;
 }
 
-template <template <typename, size_t, size_t> class ServerT, bool PassTimeoutArg>
+template <template <typename, size_t, size_t, size_t> class ServerT, bool PassTimeoutArg>
 bool run_tcp_64conn_ping_pong(const pollnet_bench::BenchConfig& cfg, std::string_view label) {
     constexpr size_t kNumConns = 64;
-    using Server = ServerT<pollnet::EmptyUserData, 4096, kNumConns>;
+    using Server = ServerT<pollnet::EmptyUserData, 4096, kNumConns, 0>;
     using Client = pollnet::TcpClient<pollnet::EmptyUserData, 4096>;
 
     std::atomic<uint16_t> port{0};
