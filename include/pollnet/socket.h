@@ -24,7 +24,6 @@ namespace pollnet {
 
 namespace detail {
 
-// 统一设置非阻塞模式
 [[nodiscard]] inline bool set_nonblocking(socket_t fd) noexcept {
 #ifdef _WIN32
     u_long mode = 1;
@@ -95,9 +94,8 @@ inline void apply_socket_tuning(socket_t fd, bool is_tcp, int recv_buf_bytes, in
         out_err = get_last_error();
         return -1;
     }
-    if (ready == 0) {
-        return 0;
-    }
+    if (ready == 0) return 0;
+
     int so_err = 0;
     int len = static_cast<int>(sizeof(so_err));
     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &len) < 0) {
@@ -124,9 +122,8 @@ inline void apply_socket_tuning(socket_t fd, bool is_tcp, int recv_buf_bytes, in
         out_err = err;
         return -1;
     }
-    if (ready == 0) {
-        return 0;
-    }
+    if (ready == 0) return 0;
+
     int so_err = 0;
     socklen_t len = sizeof(so_err);
     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &len) < 0) {
@@ -145,18 +142,18 @@ inline void apply_socket_tuning(socket_t fd, bool is_tcp, int recv_buf_bytes, in
 #endif
 }
 
-// UDP 共享底层基类，避免 SocketUdpSocket / SocketUdpReceiver / SocketUdpSender 重复代码
-class UdpSocketBase {
+// 共享 TCP 监听器（供 SocketTcpServer 与 EventLoopTcpServer 复用）
+class TcpListener {
    public:
-    UdpSocketBase() = default;
-    UdpSocketBase(const UdpSocketBase&) = delete;
-    UdpSocketBase& operator=(const UdpSocketBase&) = delete;
-    UdpSocketBase(UdpSocketBase&&) = delete;
-    UdpSocketBase& operator=(UdpSocketBase&&) = delete;
+    TcpListener() = default;
+    TcpListener(const TcpListener&) = delete;
+    TcpListener& operator=(const TcpListener&) = delete;
+    TcpListener(TcpListener&&) = delete;
+    TcpListener& operator=(TcpListener&&) = delete;
 
-    ~UdpSocketBase() { close("destruct"); }
+    ~TcpListener() { close("destruct"); }
 
-    [[nodiscard]] bool openSocket(const UdpSocketOptions& opts, bool reuse_addr) noexcept {
+    [[nodiscard]] bool listen(const TcpServerOptions& opts) noexcept {
         close("reinit");
 
         if (!ensure_network_init()) {
@@ -164,43 +161,14 @@ class UdpSocketBase {
             return false;
         }
 
-        auto bind_ep = Endpoint::from(opts.bind_ip, opts.bind_port);
-        if (!bind_ep) {
-            saveError("invalid bind_ip", false);
+        auto ep = Endpoint::from(opts.host, opts.port);
+        if (!ep) {
+            saveError("invalid host", false);
             return false;
         }
 
-        const bool has_dest = !opts.dest_ip.empty();
-        std::optional<Endpoint> dest_ep;
-        if (has_dest) {
-            dest_ep = Endpoint::from(opts.dest_ip, opts.dest_port);
-            if (!dest_ep) {
-                saveError("invalid dest_ip", false);
-                return false;
-            }
-        }
-
-        const bool has_mcast = !opts.multicast_group_ip.empty();
-        std::optional<Endpoint> mcast_group_ep;
-        std::optional<Endpoint> mcast_iface_ep;
-        if (has_mcast) {
-            mcast_group_ep = Endpoint::from(opts.multicast_group_ip, 0);
-            if (!mcast_group_ep) {
-                saveError("invalid multicast_group_ip", false);
-                return false;
-            }
-            if (!opts.multicast_interface_ip.empty()) {
-                mcast_iface_ep = Endpoint::from(opts.multicast_interface_ip, 0);
-                if (!mcast_iface_ep) {
-                    saveError("invalid multicast_interface_ip", false);
-                    return false;
-                }
-            } else {
-                mcast_iface_ep = Endpoint::any(0);
-            }
-        }
-
-        if ((fd_ = ::socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET_FD) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ == INVALID_SOCKET_FD) {
             saveError("socket error", true);
             return false;
         }
@@ -210,60 +178,26 @@ class UdpSocketBase {
             return false;
         }
 
-#ifdef _WIN32
-        disable_udp_connreset(fd_);
-#endif
-        apply_socket_tuning(fd_, false, opts.recv_buf_bytes, opts.send_buf_bytes, opts.busy_poll_us,
-                            false);
-
-        if (reuse_addr) {
-            int optval = 1;
-            if (::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR,
-                             reinterpret_cast<sockopt_val_t>(&optval), sizeof(int)) < 0) {
-                close("setsockopt SO_REUSEADDR error", true);
-                return false;
-            }
-        }
-
-        struct sockaddr_in servaddr = bind_ep->raw;
-#ifdef _WIN32
-        // Windows 下不允许将 UDP socket 直接 bind 到组播地址，需绑定 INADDR_ANY
-        if (has_mcast) {
-            servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-        }
-#endif
-        if (::bind(fd_, reinterpret_cast<const struct sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
-            close("bind failed", true);
+        int yes = 1;
+        if (::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<sockopt_val_t>(&yes),
+                         sizeof(yes)) < 0) {
+            close("setsockopt SO_REUSEADDR error", true);
             return false;
         }
 
-        if (has_mcast) {
-            struct ip_mreq group{};
-            group.imr_interface = mcast_iface_ep->raw.sin_addr;
-            group.imr_multiaddr = mcast_group_ep->raw.sin_addr;
-            if (::setsockopt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                             reinterpret_cast<sockopt_val_t>(&group), sizeof(group)) < 0) {
-                close("setsockopt IP_ADD_MEMBERSHIP failed", true);
-                return false;
-            }
+        apply_socket_tuning(fd_, true, opts.recv_buf_bytes, opts.send_buf_bytes, opts.busy_poll_us,
+                            opts.tcp_quickack);
+
+        if (::bind(fd_, reinterpret_cast<const struct sockaddr*>(&ep->raw), sizeof(ep->raw)) < 0) {
+            close("bind error", true);
+            return false;
         }
 
-        if (has_dest) {
-            if (::connect(fd_, reinterpret_cast<const struct sockaddr*>(&dest_ep->raw),
-                          sizeof(dest_ep->raw)) < 0) {
-                close("connect error", true);
-                return false;
-            }
-            if (opts.multicast_ttl > 0) {
-                int ttl = opts.multicast_ttl;
-                if (::setsockopt(fd_, IPPROTO_IP, IP_MULTICAST_TTL,
-                                 reinterpret_cast<sockopt_val_t>(&ttl), sizeof(ttl)) < 0) {
-                    close("setsockopt IP_MULTICAST_TTL failed", true);
-                    return false;
-                }
-            }
+        int backlog = (opts.backlog > 0) ? opts.backlog : 128;
+        if (::listen(fd_, backlog) < 0) {
+            close("listen error", true);
+            return false;
         }
-
         return true;
     }
 
@@ -275,7 +209,19 @@ class UdpSocketBase {
         }
     }
 
-    [[nodiscard]] bool isOpen() const noexcept { return fd_ != INVALID_SOCKET_FD; }
+    [[nodiscard]] socket_t acceptOne(Endpoint& peer_ep) noexcept {
+        if (fd_ == INVALID_SOCKET_FD) return INVALID_SOCKET_FD;
+        socklen_t addr_len = sizeof(peer_ep.raw);
+        for (;;) {
+            socket_t client_fd =
+                ::accept(fd_, reinterpret_cast<struct sockaddr*>(&peer_ep.raw), &addr_len);
+            if (client_fd != INVALID_SOCKET_FD) return client_fd;
+            if (!is_eintr(get_last_error())) return INVALID_SOCKET_FD;
+            addr_len = sizeof(peer_ep.raw);
+        }
+    }
+
+    [[nodiscard]] socket_t fd() const noexcept { return fd_; }
     [[nodiscard]] bool isClosed() const noexcept { return fd_ == INVALID_SOCKET_FD; }
     [[nodiscard]] std::string_view lastError() const noexcept { return last_error_; }
 
@@ -289,169 +235,11 @@ class UdpSocketBase {
         return ntohs(addr.sin_port);
     }
 
-    [[nodiscard]] bool send(const void* data, size_t size) noexcept {
-        if (fd_ == INVALID_SOCKET_FD) return false;
-        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
-        int ret = 0;
-        do {
-            ret = ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0);
-        } while (ret < 0 && is_eintr(get_last_error()));
-        return ret == static_cast<int>(size);
-    }
-
-    [[nodiscard]] bool sendTo(const void* data, size_t size, const Endpoint& dst) noexcept {
-        if (fd_ == INVALID_SOCKET_FD) return false;
-        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
-        int ret = 0;
-        do {
-            ret = ::sendto(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
-                           reinterpret_cast<const struct sockaddr*>(&dst.raw), sizeof(dst.raw));
-        } while (ret < 0 && is_eintr(get_last_error()));
-        return ret == static_cast<int>(size);
-    }
-
-    [[nodiscard]] size_t sendBatchImpl(std::span<const std::span<const uint8_t>> packets,
-                                       const Endpoint* dst) noexcept {
-        if (fd_ == INVALID_SOCKET_FD || packets.empty()) return 0;
-#ifdef __linux__
-        constexpr size_t kBatchSize = 64;
-        size_t total_sent = 0;
-        size_t offset = 0;
-        while (offset < packets.size()) {
-            size_t count = std::min(kBatchSize, packets.size() - offset);
-            struct mmsghdr msgs[kBatchSize]{};
-            struct iovec iovs[kBatchSize]{};
-            for (size_t i = 0; i < count; ++i) {
-                const auto& pkt = packets[offset + i];
-                iovs[i].iov_base = const_cast<uint8_t*>(pkt.data());
-                iovs[i].iov_len = pkt.size();
-                msgs[i].msg_hdr.msg_iov = &iovs[i];
-                msgs[i].msg_hdr.msg_iovlen = 1;
-                if (dst != nullptr) {
-                    msgs[i].msg_hdr.msg_name = const_cast<sockaddr_in*>(&dst->raw);
-                    msgs[i].msg_hdr.msg_namelen = sizeof(dst->raw);
-                }
-            }
-            int ret = 0;
-            do {
-                ret = ::sendmmsg(fd_, msgs, static_cast<unsigned int>(count), MSG_DONTWAIT);
-            } while (ret < 0 && is_eintr(get_last_error()));
-            if (ret <= 0) {
-                break;
-            }
-            total_sent += static_cast<size_t>(ret);
-            if (static_cast<size_t>(ret) < count) {
-                break;
-            }
-            offset += count;
-        }
-        return total_sent;
-#else
-        size_t total_sent = 0;
-        for (const auto& pkt : packets) {
-            bool ok = (dst != nullptr) ? sendTo(pkt.data(), pkt.size(), *dst)
-                                       : send(pkt.data(), pkt.size());
-            if (!ok) break;
-            ++total_sent;
-        }
-        return total_sent;
-#endif
-    }
-
-    template <UdpDataHandler Handler>
-    [[nodiscard]] bool recvImpl(uint8_t* buf, size_t buf_size, Handler& handler) {
-        if (fd_ == INVALID_SOCKET_FD) return false;
-        int n = 0;
-        do {
-            n = ::recv(fd_, reinterpret_cast<char*>(buf), static_cast<int>(buf_size), 0);
-        } while (n < 0 && is_eintr(get_last_error()));
-
-        if (n > 0) {
-            handler(std::span<const uint8_t>{buf, static_cast<size_t>(n)});
-            return true;
-        }
-        return false;
-    }
-
-    template <UdpPacketHandler Handler>
-    [[nodiscard]] bool recvFromImpl(uint8_t* buf, size_t buf_size, Handler& handler) {
-        if (fd_ == INVALID_SOCKET_FD) return false;
-        Endpoint peer_ep;
-        socklen_t addrlen = sizeof(peer_ep.raw);
-        int n = 0;
-        do {
-            n = ::recvfrom(fd_, reinterpret_cast<char*>(buf), static_cast<int>(buf_size), 0,
-                           reinterpret_cast<struct sockaddr*>(&peer_ep.raw), &addrlen);
-        } while (n < 0 && is_eintr(get_last_error()));
-
-        if (n > 0) {
-            handler(std::span<const uint8_t>{buf, static_cast<size_t>(n)}, peer_ep);
-            return true;
-        }
-        return false;
-    }
-
-    template <size_t MaxBatch, size_t BufSize, bool WantPeer, typename Handler>
-    [[nodiscard]] size_t recvBatchImpl(Handler& handler) {
-        static_assert(MaxBatch > 0 && MaxBatch <= 64, "MaxBatch must be in [1, 64]");
-        static_assert(MaxBatch * BufSize <= 256 * 1024, "Batch stack buffer exceeds 256 KiB");
-        if (fd_ == INVALID_SOCKET_FD) return 0;
-
-#ifdef __linux__
-        alignas(16) uint8_t batch_buf[MaxBatch][BufSize];
-        struct mmsghdr msgs[MaxBatch]{};
-        struct iovec iovs[MaxBatch]{};
-        Endpoint peers[MaxBatch]{};
-
-        for (size_t i = 0; i < MaxBatch; ++i) {
-            iovs[i].iov_base = batch_buf[i];
-            iovs[i].iov_len = BufSize;
-            msgs[i].msg_hdr.msg_iov = &iovs[i];
-            msgs[i].msg_hdr.msg_iovlen = 1;
-            if constexpr (WantPeer) {
-                msgs[i].msg_hdr.msg_name = &peers[i].raw;
-                msgs[i].msg_hdr.msg_namelen = sizeof(peers[i].raw);
-            }
-        }
-
-        int n = 0;
-        do {
-            n = ::recvmmsg(fd_, msgs, static_cast<unsigned int>(MaxBatch), MSG_DONTWAIT, nullptr);
-        } while (n < 0 && is_eintr(get_last_error()));
-
-        if (n <= 0) return 0;
-
-        for (int i = 0; i < n; ++i) {
-            size_t len = static_cast<size_t>(msgs[i].msg_len);
-            if (len > BufSize) len = BufSize;
-            if constexpr (WantPeer) {
-                handler(std::span<const uint8_t>{batch_buf[i], len}, peers[i]);
-            } else {
-                handler(std::span<const uint8_t>{batch_buf[i], len});
-            }
-        }
-        return static_cast<size_t>(n);
-#else
-        uint8_t single_buf[BufSize];
-        size_t count = 0;
-        for (; count < MaxBatch; ++count) {
-            bool ok = false;
-            if constexpr (WantPeer) {
-                ok = recvFromImpl(single_buf, BufSize, handler);
-            } else {
-                ok = recvImpl(single_buf, BufSize, handler);
-            }
-            if (!ok) break;
-        }
-        return count;
-#endif
-    }
-
+   private:
     void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
         format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
     }
 
-   private:
     socket_t fd_ = INVALID_SOCKET_FD;
     char last_error_[128] = "";
 };
@@ -467,6 +255,9 @@ class SocketTcpClient;
 
 template <typename UserData, size_t RecvBufSize, size_t MaxConns>
 class SocketTcpServer;
+
+template <typename UserData, size_t RecvBufSize, size_t MaxConns>
+class EventLoopTcpServer;
 
 template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096>
 class SocketTcpConnection : public UserData {
@@ -484,7 +275,6 @@ class SocketTcpConnection : public UserData {
     ~SocketTcpConnection() { close("destruct"); }
 
     [[nodiscard]] std::string_view lastError() const noexcept { return last_error_; }
-
     [[nodiscard]] bool isConnected() const noexcept { return fd_ != detail::INVALID_SOCKET_FD; }
 
     [[nodiscard]] std::optional<Endpoint> peer() const noexcept {
@@ -527,9 +317,7 @@ class SocketTcpConnection : public UserData {
 
         if (ret < 0) {
             int err = detail::get_last_error();
-            if (detail::is_would_block(err)) {
-                return 0;
-            }
+            if (detail::is_would_block(err)) return 0;
             close("send error", true, err);
             return -1;
         }
@@ -539,58 +327,11 @@ class SocketTcpConnection : public UserData {
         return ret;
     }
 
-    [[nodiscard]] int writeSome(std::span<const std::byte> data, bool more = false) noexcept {
-        return writeSome(data.data(), data.size(), more);
+    [[nodiscard]] int writeSome(IoSlice slice, bool more = false) noexcept {
+        return writeSome(slice.data, slice.size, more);
     }
 
-    [[nodiscard]] int writeSome(std::span<const uint8_t> data, bool more = false) noexcept {
-        return writeSome(data.data(), data.size(), more);
-    }
-
-    [[nodiscard]] bool writeNonblock(const void* data, size_t size, bool more = false) noexcept {
-        if (size == 0) return isConnected();
-        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-            close("send size overflow", false);
-            return false;
-        }
-        int sent = writeSome(data, size, more);
-        if (sent < 0) return false;
-        if (sent != static_cast<int>(size)) {
-            close("send buffer full", false);
-            return false;
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool writeNonblock(std::span<const std::byte> data, bool more = false) noexcept {
-        return writeNonblock(data.data(), data.size(), more);
-    }
-
-    [[nodiscard]] bool writeNonblock(std::span<const uint8_t> data, bool more = false) noexcept {
-        return writeNonblock(data.data(), data.size(), more);
-    }
-
-    [[nodiscard]] bool write(const void* data_, size_t size, bool more = false) noexcept {
-        if (size == 0) return isConnected();
-        const uint8_t* data = static_cast<const uint8_t*>(data_);
-        do {
-            int sent = writeSome(data, size, more);
-            if (sent < 0) return false;
-            data += sent;
-            size -= static_cast<size_t>(sent);
-        } while (size != 0);
-        return true;
-    }
-
-    [[nodiscard]] bool write(std::span<const std::byte> data, bool more = false) noexcept {
-        return write(data.data(), data.size(), more);
-    }
-
-    [[nodiscard]] bool write(std::span<const uint8_t> data, bool more = false) noexcept {
-        return write(data.data(), data.size(), more);
-    }
-
-    [[nodiscard]] int writevSome(std::span<const IoSlice> slices, bool more = false) noexcept {
+    [[nodiscard]] int writeSome(std::span<const IoSlice> slices, bool more = false) noexcept {
         if (fd_ == detail::INVALID_SOCKET_FD) return -1;
         if (slices.empty()) return 0;
 
@@ -622,9 +363,7 @@ class SocketTcpConnection : public UserData {
         int rc = ::WSASend(fd_, bufs, buf_cnt, &sent_bytes, 0, nullptr, nullptr);
         if (rc == SOCKET_ERROR) {
             int err = detail::get_last_error();
-            if (detail::is_would_block(err)) {
-                return 0;
-            }
+            if (detail::is_would_block(err)) return 0;
             close("WSASend error", true, err);
             return -1;
         }
@@ -667,9 +406,7 @@ class SocketTcpConnection : public UserData {
 
         if (ret < 0) {
             int err = detail::get_last_error();
-            if (detail::is_would_block(err)) {
-                return 0;
-            }
+            if (detail::is_would_block(err)) return 0;
             close("sendmsg error", true, err);
             return -1;
         }
@@ -680,7 +417,26 @@ class SocketTcpConnection : public UserData {
 #endif
     }
 
-    [[nodiscard]] bool writevNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
+    [[nodiscard]] bool writeNonblock(const void* data, size_t size, bool more = false) noexcept {
+        if (size == 0) return isConnected();
+        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            close("send size overflow", false);
+            return false;
+        }
+        int sent = writeSome(data, size, more);
+        if (sent < 0) return false;
+        if (static_cast<size_t>(sent) != size) {
+            close("send buffer full", false);
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool writeNonblock(IoSlice slice, bool more = false) noexcept {
+        return writeNonblock(slice.data, slice.size, more);
+    }
+
+    [[nodiscard]] bool writeNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
         constexpr size_t kMaxIov = 64;
         size_t total_bytes = 0;
         for (const auto& s : slices) {
@@ -698,7 +454,7 @@ class SocketTcpConnection : public UserData {
         if (total_bytes == 0) return isConnected();
 
         if (slices.size() <= kMaxIov) {
-            int sent = writevSome(slices, more);
+            int sent = writeSome(slices, more);
             if (sent < 0) return false;
             if (static_cast<size_t>(sent) != total_bytes) {
                 close("send buffer full", false);
@@ -713,7 +469,7 @@ class SocketTcpConnection : public UserData {
             size_t chunk_bytes = 0;
             for (size_t i = 0; i < count; ++i) chunk_bytes += slices[offset + i].size;
             bool chunk_more = more || (offset + count < slices.size());
-            int sent = writevSome(slices.subspan(offset, count), chunk_more);
+            int sent = writeSome(slices.subspan(offset, count), chunk_more);
             if (sent < 0) return false;
             if (static_cast<size_t>(sent) != chunk_bytes) {
                 close("send buffer full", false);
@@ -724,7 +480,23 @@ class SocketTcpConnection : public UserData {
         return true;
     }
 
-    [[nodiscard]] bool writev(std::span<const IoSlice> slices, bool more = false) noexcept {
+    [[nodiscard]] bool write(const void* data_, size_t size, bool more = false) noexcept {
+        if (size == 0) return isConnected();
+        const uint8_t* data = static_cast<const uint8_t*>(data_);
+        do {
+            int sent = writeSome(data, size, more);
+            if (sent < 0) return false;
+            data += sent;
+            size -= static_cast<size_t>(sent);
+        } while (size != 0);
+        return true;
+    }
+
+    [[nodiscard]] bool write(IoSlice slice, bool more = false) noexcept {
+        return write(slice.data, slice.size, more);
+    }
+
+    [[nodiscard]] bool write(std::span<const IoSlice> slices, bool more = false) noexcept {
         constexpr size_t kMaxIov = 64;
         size_t total_bytes = 0;
         for (const auto& s : slices) {
@@ -750,7 +522,7 @@ class SocketTcpConnection : public UserData {
             }
             if (cnt == 0) break;
 
-            int sent = writevSome(std::span<const IoSlice>{cur.data(), cnt}, more);
+            int sent = writeSome(std::span<const IoSlice>{cur.data(), cnt}, more);
             if (sent < 0) return false;
             size_t adv = static_cast<size_t>(sent);
             while (adv > 0 && idx < slices.size()) {
@@ -781,9 +553,6 @@ class SocketTcpConnection : public UserData {
 
     template <typename, size_t, size_t>
     friend class EventLoopTcpServer;
-
-    template <typename, size_t, size_t>
-    friend class IoUringTcpServer;
 
     template <typename Handler>
     void pollConn(int64_t now, Handler& handler) {
@@ -982,41 +751,31 @@ class SocketTcpClient {
     [[nodiscard]] int writeSome(const void* data, size_t size, bool more = false) noexcept {
         return conn_.writeSome(data, size, more);
     }
-    [[nodiscard]] int writeSome(std::span<const std::byte> data, bool more = false) noexcept {
-        return conn_.writeSome(data, more);
+    [[nodiscard]] int writeSome(IoSlice slice, bool more = false) noexcept {
+        return conn_.writeSome(slice, more);
     }
-    [[nodiscard]] int writeSome(std::span<const uint8_t> data, bool more = false) noexcept {
-        return conn_.writeSome(data, more);
+    [[nodiscard]] int writeSome(std::span<const IoSlice> slices, bool more = false) noexcept {
+        return conn_.writeSome(slices, more);
     }
 
     [[nodiscard]] bool writeNonblock(const void* data, size_t size, bool more = false) noexcept {
         return conn_.writeNonblock(data, size, more);
     }
-    [[nodiscard]] bool writeNonblock(std::span<const std::byte> data, bool more = false) noexcept {
-        return conn_.writeNonblock(data, more);
+    [[nodiscard]] bool writeNonblock(IoSlice slice, bool more = false) noexcept {
+        return conn_.writeNonblock(slice, more);
     }
-    [[nodiscard]] bool writeNonblock(std::span<const uint8_t> data, bool more = false) noexcept {
-        return conn_.writeNonblock(data, more);
+    [[nodiscard]] bool writeNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
+        return conn_.writeNonblock(slices, more);
     }
 
     [[nodiscard]] bool write(const void* data, size_t size, bool more = false) noexcept {
         return conn_.write(data, size, more);
     }
-    [[nodiscard]] bool write(std::span<const std::byte> data, bool more = false) noexcept {
-        return conn_.write(data, more);
+    [[nodiscard]] bool write(IoSlice slice, bool more = false) noexcept {
+        return conn_.write(slice, more);
     }
-    [[nodiscard]] bool write(std::span<const uint8_t> data, bool more = false) noexcept {
-        return conn_.write(data, more);
-    }
-
-    [[nodiscard]] int writevSome(std::span<const IoSlice> slices, bool more = false) noexcept {
-        return conn_.writevSome(slices, more);
-    }
-    [[nodiscard]] bool writevNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
-        return conn_.writevNonblock(slices, more);
-    }
-    [[nodiscard]] bool writev(std::span<const IoSlice> slices, bool more = false) noexcept {
-        return conn_.writev(slices, more);
+    [[nodiscard]] bool write(std::span<const IoSlice> slices, bool more = false) noexcept {
+        return conn_.write(slices, more);
     }
 
     template <typename Handler>
@@ -1176,52 +935,9 @@ class SocketTcpServer {
             conns_[i]->close("reinit");
         }
         conns_cnt_ = 0;
-        close("reinit");
-
-        if (!detail::ensure_network_init()) {
-            saveError("WSAStartup failed", false);
+        if (!listener_.listen(opts)) {
             return false;
         }
-
-        auto ep = Endpoint::from(opts.host, opts.port);
-        if (!ep) {
-            saveError("invalid host", false);
-            return false;
-        }
-
-        listenfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listenfd_ == detail::INVALID_SOCKET_FD) {
-            saveError("socket error", true);
-            return false;
-        }
-
-        if (!detail::set_nonblocking(listenfd_)) {
-            close("set nonblock error", true);
-            return false;
-        }
-
-        int yes = 1;
-        if (::setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR,
-                         reinterpret_cast<detail::sockopt_val_t>(&yes), sizeof(yes)) < 0) {
-            close("setsockopt SO_REUSEADDR error", true);
-            return false;
-        }
-
-        detail::apply_socket_tuning(listenfd_, true, opts.recv_buf_bytes, opts.send_buf_bytes,
-                                    opts.busy_poll_us, opts.tcp_quickack);
-
-        if (::bind(listenfd_, reinterpret_cast<const struct sockaddr*>(&ep->raw), sizeof(ep->raw)) <
-            0) {
-            close("bind error", true);
-            return false;
-        }
-
-        int backlog = (opts.backlog > 0) ? opts.backlog : 128;
-        if (::listen(listenfd_, backlog) < 0) {
-            close("listen error", true);
-            return false;
-        }
-
         send_timeout_ns_ = detail::to_timeout_ns(opts.send_timeout);
         recv_timeout_ns_ = detail::to_timeout_ns(opts.recv_timeout);
         accept_poll_interval_ = opts.accept_poll_interval;
@@ -1234,37 +950,19 @@ class SocketTcpServer {
     }
 
     void close(const char* reason, bool check_errno = false, int err_override = 0) noexcept {
-        if (listenfd_ != detail::INVALID_SOCKET_FD) {
-            saveError(reason, check_errno, err_override);
-            detail::close_socket(listenfd_);
-            listenfd_ = detail::INVALID_SOCKET_FD;
-        }
+        listener_.close(reason, check_errno, err_override);
     }
 
-    [[nodiscard]] std::string_view lastError() const noexcept { return last_error_; }
-
-    [[nodiscard]] bool isClosed() const noexcept {
-        return listenfd_ == detail::INVALID_SOCKET_FD;
-    }
-
+    [[nodiscard]] std::string_view lastError() const noexcept { return listener_.lastError(); }
+    [[nodiscard]] bool isClosed() const noexcept { return listener_.isClosed(); }
     [[nodiscard]] size_t connCount() const noexcept { return conns_cnt_; }
-
-    [[nodiscard]] uint16_t localPort() const noexcept {
-        if (listenfd_ == detail::INVALID_SOCKET_FD) return 0;
-        struct sockaddr_in addr{};
-        socklen_t addrlen = sizeof(addr);
-        if (::getsockname(listenfd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
-            return 0;
-        }
-        return ntohs(addr.sin_port);
-    }
+    [[nodiscard]] uint16_t localPort() const noexcept { return listener_.localPort(); }
 
     template <typename Handler>
         requires std::invocable<Handler&, Conn&>
     void foreachConn(Handler handler) {
         for (size_t i = 0; i < conns_cnt_; i++) {
-            Conn& c = *conns_[i];
-            handler(c);
+            handler(*conns_[i]);
         }
     }
 
@@ -1279,7 +977,7 @@ class SocketTcpServer {
         requires TcpHandler<Handler, Conn>
     void poll(Handler& handler, int64_t now) {
         bool check_accept = false;
-        if (!isClosed() && conns_cnt_ < MaxConns) {
+        if (!listener_.isClosed() && conns_cnt_ < MaxConns) {
             if (conns_cnt_ == 0 || accept_poll_interval_ <= 1) {
                 check_accept = true;
             } else if (++accept_poll_counter_ >= accept_poll_interval_) {
@@ -1287,16 +985,12 @@ class SocketTcpServer {
                 check_accept = true;
             }
         }
-        while (check_accept && !isClosed() && conns_cnt_ < MaxConns) {
-            struct sockaddr_in clientaddr{};
-            socklen_t addr_len = sizeof(clientaddr);
-            detail::socket_t fd =
-                ::accept(listenfd_, reinterpret_cast<struct sockaddr*>(&clientaddr), &addr_len);
-            if (fd == detail::INVALID_SOCKET_FD) {
-                if (detail::is_eintr(detail::get_last_error())) continue;
-                break;
-            }
-            if (!detail::dispatch_allow_new_connection(handler, Endpoint(clientaddr))) {
+        while (check_accept && !listener_.isClosed() && conns_cnt_ < MaxConns) {
+            Endpoint peer_ep;
+            detail::socket_t fd = listener_.acceptOne(peer_ep);
+            if (fd == detail::INVALID_SOCKET_FD) break;
+
+            if (!detail::dispatch_allow_new_connection(handler, peer_ep)) {
                 detail::close_socket(fd);
                 continue;
             }
@@ -1321,11 +1015,7 @@ class SocketTcpServer {
     }
 
    private:
-    void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
-        detail::format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
-    }
-
-    detail::socket_t listenfd_ = detail::INVALID_SOCKET_FD;
+    detail::TcpListener listener_;
     size_t conns_cnt_ = 0;
     uint32_t accept_poll_interval_ = 64;
     uint32_t accept_poll_counter_ = 0;
@@ -1337,11 +1027,10 @@ class SocketTcpServer {
     int send_buf_bytes_ = 0;
     Conn* conns_[MaxConns]{};
     Conn conns_data_[MaxConns];
-    char last_error_[128] = "";
 };
 
 // ==========================================
-// UDP 后端实现 (Socket Backend - UDP)
+// 统一 UDP 后端实现 (Socket Backend - UDP)
 // ==========================================
 
 template <size_t RecvBufSize = 1500>
@@ -1357,192 +1046,327 @@ class SocketUdpSocket {
     SocketUdpSocket(SocketUdpSocket&&) = delete;
     SocketUdpSocket& operator=(SocketUdpSocket&&) = delete;
 
-    [[nodiscard]] bool open(const UdpSocketOptions& opts) noexcept {
-        return base_.openSocket(opts, true);
-    }
+    ~SocketUdpSocket() { close("destruct"); }
 
-    void close(const char* reason) noexcept { base_.close(reason); }
+    [[nodiscard]] bool open(const UdpOptions& opts) noexcept {
+        close("reinit");
 
-    [[nodiscard]] bool isOpen() const noexcept { return base_.isOpen(); }
-    [[nodiscard]] bool isClosed() const noexcept { return base_.isClosed(); }
-    [[nodiscard]] uint16_t localPort() const noexcept { return base_.localPort(); }
-    [[nodiscard]] std::string_view lastError() const noexcept { return base_.lastError(); }
-
-    [[nodiscard]] bool send(const void* data, size_t size) noexcept {
-        return base_.send(data, size);
-    }
-    [[nodiscard]] bool send(std::span<const std::byte> data) noexcept {
-        return base_.send(data.data(), data.size());
-    }
-    [[nodiscard]] bool send(std::span<const uint8_t> data) noexcept {
-        return base_.send(data.data(), data.size());
-    }
-    [[nodiscard]] size_t sendBatch(std::span<const std::span<const uint8_t>> packets) noexcept {
-        return base_.sendBatchImpl(packets, nullptr);
-    }
-
-    [[nodiscard]] bool sendTo(const void* data, size_t size, const Endpoint& dst) noexcept {
-        return base_.sendTo(data, size, dst);
-    }
-    [[nodiscard]] bool sendTo(std::span<const std::byte> data, const Endpoint& dst) noexcept {
-        return base_.sendTo(data.data(), data.size(), dst);
-    }
-    [[nodiscard]] bool sendTo(std::span<const uint8_t> data, const Endpoint& dst) noexcept {
-        return base_.sendTo(data.data(), data.size(), dst);
-    }
-    [[nodiscard]] size_t sendToBatch(std::span<const std::span<const uint8_t>> packets,
-                                     const Endpoint& dst) noexcept {
-        return base_.sendBatchImpl(packets, &dst);
-    }
-
-    template <UdpDataHandler Handler>
-    [[nodiscard]] bool recv(Handler handler) {
-        return base_.recvImpl(buf_, RecvBufSize, handler);
-    }
-
-    template <UdpPacketHandler Handler>
-    [[nodiscard]] bool recvFrom(Handler handler) {
-        return base_.recvFromImpl(buf_, RecvBufSize, handler);
-    }
-
-    template <size_t MaxBatch = 16, UdpDataHandler Handler>
-    [[nodiscard]] size_t recvBatch(Handler handler) {
-        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, false>(handler);
-    }
-
-    template <size_t MaxBatch = 16, UdpPacketHandler Handler>
-    [[nodiscard]] size_t recvFromBatch(Handler handler) {
-        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, true>(handler);
-    }
-
-   private:
-    detail::UdpSocketBase base_;
-    uint8_t buf_[RecvBufSize];
-};
-
-template <size_t RecvBufSize = 1500>
-class SocketUdpReceiver {
-    static_assert(RecvBufSize > 0 &&
-                      RecvBufSize <= static_cast<size_t>(std::numeric_limits<int>::max()),
-                  "RecvBufSize must be in (0, INT_MAX]");
-
-   public:
-    SocketUdpReceiver() = default;
-    SocketUdpReceiver(const SocketUdpReceiver&) = delete;
-    SocketUdpReceiver& operator=(const SocketUdpReceiver&) = delete;
-    SocketUdpReceiver(SocketUdpReceiver&&) = delete;
-    SocketUdpReceiver& operator=(SocketUdpReceiver&&) = delete;
-
-    [[nodiscard]] bool open(const UdpReceiverOptions& opts) noexcept {
-        UdpSocketOptions sock_opts{};
-        sock_opts.bind_ip = opts.bind_ip;
-        sock_opts.bind_port = opts.bind_port;
-        sock_opts.interface = opts.interface;
-        sock_opts.busy_poll_us = opts.busy_poll_us;
-        sock_opts.recv_buf_bytes = opts.recv_buf_bytes;
-        sock_opts.send_buf_bytes = opts.send_buf_bytes;
-        if (!opts.multicast_interface_ip.empty()) {
-            sock_opts.multicast_group_ip = opts.bind_ip;
-            sock_opts.multicast_interface_ip = opts.multicast_interface_ip;
-        }
-        return base_.openSocket(sock_opts, true);
-    }
-
-    void close(const char* reason) noexcept { base_.close(reason); }
-
-    [[nodiscard]] bool isOpen() const noexcept { return base_.isOpen(); }
-    [[nodiscard]] bool isClosed() const noexcept { return base_.isClosed(); }
-    [[nodiscard]] uint16_t localPort() const noexcept { return base_.localPort(); }
-    [[nodiscard]] std::string_view lastError() const noexcept { return base_.lastError(); }
-
-    template <UdpDataHandler Handler>
-    [[nodiscard]] bool recv(Handler handler) {
-        return base_.recvImpl(buf_, RecvBufSize, handler);
-    }
-
-    template <UdpPacketHandler Handler>
-    [[nodiscard]] bool recvFrom(Handler handler) {
-        return base_.recvFromImpl(buf_, RecvBufSize, handler);
-    }
-
-    template <size_t MaxBatch = 16, UdpDataHandler Handler>
-    [[nodiscard]] size_t recvBatch(Handler handler) {
-        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, false>(handler);
-    }
-
-    template <size_t MaxBatch = 16, UdpPacketHandler Handler>
-    [[nodiscard]] size_t recvFromBatch(Handler handler) {
-        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, true>(handler);
-    }
-
-    [[nodiscard]] bool sendTo(const void* data, size_t size, const Endpoint& dst) noexcept {
-        return base_.sendTo(data, size, dst);
-    }
-    [[nodiscard]] bool sendTo(std::span<const std::byte> data, const Endpoint& dst) noexcept {
-        return base_.sendTo(data.data(), data.size(), dst);
-    }
-    [[nodiscard]] bool sendTo(std::span<const uint8_t> data, const Endpoint& dst) noexcept {
-        return base_.sendTo(data.data(), data.size(), dst);
-    }
-    [[nodiscard]] size_t sendToBatch(std::span<const std::span<const uint8_t>> packets,
-                                     const Endpoint& dst) noexcept {
-        return base_.sendBatchImpl(packets, &dst);
-    }
-
-   private:
-    detail::UdpSocketBase base_;
-    uint8_t buf_[RecvBufSize];
-};
-
-class SocketUdpSender {
-   public:
-    SocketUdpSender() = default;
-    SocketUdpSender(const SocketUdpSender&) = delete;
-    SocketUdpSender& operator=(const SocketUdpSender&) = delete;
-    SocketUdpSender(SocketUdpSender&&) = delete;
-    SocketUdpSender& operator=(SocketUdpSender&&) = delete;
-
-    [[nodiscard]] bool open(const UdpSenderOptions& opts) noexcept {
-        if (opts.dest_ip.empty()) {
-            base_.close("reinit");
-            base_.saveError("invalid dest_ip", false);
+        if (!detail::ensure_network_init()) {
+            saveError("WSAStartup failed", false);
             return false;
         }
-        UdpSocketOptions sock_opts{};
-        sock_opts.bind_ip = opts.local_ip;
-        sock_opts.bind_port = opts.local_port;
-        sock_opts.dest_ip = opts.dest_ip;
-        sock_opts.dest_port = opts.dest_port;
-        sock_opts.interface = opts.interface;
-        sock_opts.multicast_ttl = opts.multicast_ttl;
-        sock_opts.busy_poll_us = opts.busy_poll_us;
-        sock_opts.recv_buf_bytes = opts.recv_buf_bytes;
-        sock_opts.send_buf_bytes = opts.send_buf_bytes;
-        return base_.openSocket(sock_opts, false);
+
+        auto bind_ep = Endpoint::from(opts.bind_ip, opts.bind_port);
+        if (!bind_ep) {
+            saveError("invalid bind_ip", false);
+            return false;
+        }
+
+        const bool has_dest = !opts.dest_ip.empty();
+        std::optional<Endpoint> dest_ep;
+        if (has_dest) {
+            dest_ep = Endpoint::from(opts.dest_ip, opts.dest_port);
+            if (!dest_ep) {
+                saveError("invalid dest_ip", false);
+                return false;
+            }
+        }
+
+        const bool has_mcast = !opts.multicast_group_ip.empty();
+        std::optional<Endpoint> mcast_group_ep;
+        std::optional<Endpoint> mcast_iface_ep;
+        if (has_mcast) {
+            mcast_group_ep = Endpoint::from(opts.multicast_group_ip, 0);
+            if (!mcast_group_ep) {
+                saveError("invalid multicast_group_ip", false);
+                return false;
+            }
+            if (!opts.multicast_interface_ip.empty()) {
+                mcast_iface_ep = Endpoint::from(opts.multicast_interface_ip, 0);
+                if (!mcast_iface_ep) {
+                    saveError("invalid multicast_interface_ip", false);
+                    return false;
+                }
+            } else {
+                mcast_iface_ep = Endpoint::any(0);
+            }
+        }
+
+        if ((fd_ = ::socket(AF_INET, SOCK_DGRAM, 0)) == detail::INVALID_SOCKET_FD) {
+            saveError("socket error", true);
+            return false;
+        }
+
+        if (!detail::set_nonblocking(fd_)) {
+            close("set nonblock error", true);
+            return false;
+        }
+
+#ifdef _WIN32
+        detail::disable_udp_connreset(fd_);
+#endif
+        detail::apply_socket_tuning(fd_, false, opts.recv_buf_bytes, opts.send_buf_bytes,
+                                    opts.busy_poll_us, false);
+
+        if (!has_dest || has_mcast) {
+            int optval = 1;
+            if (::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR,
+                             reinterpret_cast<detail::sockopt_val_t>(&optval), sizeof(int)) < 0) {
+                close("setsockopt SO_REUSEADDR error", true);
+                return false;
+            }
+        }
+
+        struct sockaddr_in servaddr = bind_ep->raw;
+#ifdef _WIN32
+        // Windows 下不允许将 UDP socket 直接 bind 到组播地址，需绑定 INADDR_ANY
+        if (has_mcast) {
+            servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        }
+#endif
+        if (::bind(fd_, reinterpret_cast<const struct sockaddr*>(&servaddr), sizeof(servaddr)) < 0) {
+            close("bind failed", true);
+            return false;
+        }
+
+        if (has_mcast) {
+            struct ip_mreq group{};
+            group.imr_interface = mcast_iface_ep->raw.sin_addr;
+            group.imr_multiaddr = mcast_group_ep->raw.sin_addr;
+            if (::setsockopt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                             reinterpret_cast<detail::sockopt_val_t>(&group), sizeof(group)) < 0) {
+                close("setsockopt IP_ADD_MEMBERSHIP failed", true);
+                return false;
+            }
+        }
+
+        if (has_dest) {
+            if (::connect(fd_, reinterpret_cast<const struct sockaddr*>(&dest_ep->raw),
+                          sizeof(dest_ep->raw)) < 0) {
+                close("connect error", true);
+                return false;
+            }
+            if (opts.multicast_ttl > 0) {
+                int ttl = opts.multicast_ttl;
+                if (::setsockopt(fd_, IPPROTO_IP, IP_MULTICAST_TTL,
+                                 reinterpret_cast<detail::sockopt_val_t>(&ttl), sizeof(ttl)) < 0) {
+                    close("setsockopt IP_MULTICAST_TTL failed", true);
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
-    void close(const char* reason) noexcept { base_.close(reason); }
+    void close(const char* reason, bool check_errno = false, int err_override = 0) noexcept {
+        if (fd_ != detail::INVALID_SOCKET_FD) {
+            saveError(reason, check_errno, err_override);
+            detail::close_socket(fd_);
+            fd_ = detail::INVALID_SOCKET_FD;
+        }
+    }
 
-    [[nodiscard]] bool isOpen() const noexcept { return base_.isOpen(); }
-    [[nodiscard]] bool isClosed() const noexcept { return base_.isClosed(); }
-    [[nodiscard]] uint16_t localPort() const noexcept { return base_.localPort(); }
-    [[nodiscard]] std::string_view lastError() const noexcept { return base_.lastError(); }
+    [[nodiscard]] bool isOpen() const noexcept { return fd_ != detail::INVALID_SOCKET_FD; }
+    [[nodiscard]] bool isClosed() const noexcept { return fd_ == detail::INVALID_SOCKET_FD; }
+    [[nodiscard]] std::string_view lastError() const noexcept { return last_error_; }
+
+    [[nodiscard]] uint16_t localPort() const noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return 0;
+        struct sockaddr_in addr{};
+        socklen_t addrlen = sizeof(addr);
+        if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
+            return 0;
+        }
+        return ntohs(addr.sin_port);
+    }
 
     [[nodiscard]] bool send(const void* data, size_t size) noexcept {
-        return base_.send(data, size);
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
+        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
+        int ret = 0;
+        do {
+            ret = ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0);
+        } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
+        return ret == static_cast<int>(size);
     }
-    [[nodiscard]] bool send(std::span<const std::byte> data) noexcept {
-        return base_.send(data.data(), data.size());
+
+    [[nodiscard]] bool send(IoSlice slice) noexcept { return send(slice.data, slice.size); }
+
+    [[nodiscard]] size_t sendBatch(std::span<const IoSlice> packets) noexcept {
+        return sendBatchImpl(packets, nullptr);
     }
-    [[nodiscard]] bool send(std::span<const uint8_t> data) noexcept {
-        return base_.send(data.data(), data.size());
+
+    [[nodiscard]] bool sendTo(const void* data, size_t size, const Endpoint& dst) noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
+        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
+        int ret = 0;
+        do {
+            ret = ::sendto(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
+                           reinterpret_cast<const struct sockaddr*>(&dst.raw), sizeof(dst.raw));
+        } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
+        return ret == static_cast<int>(size);
     }
-    [[nodiscard]] size_t sendBatch(std::span<const std::span<const uint8_t>> packets) noexcept {
-        return base_.sendBatchImpl(packets, nullptr);
+
+    [[nodiscard]] bool sendTo(IoSlice slice, const Endpoint& dst) noexcept {
+        return sendTo(slice.data, slice.size, dst);
+    }
+
+    [[nodiscard]] size_t sendToBatch(std::span<const IoSlice> packets,
+                                     const Endpoint& dst) noexcept {
+        return sendBatchImpl(packets, &dst);
+    }
+
+    template <UdpDataHandler Handler>
+    [[nodiscard]] bool recv(Handler handler) {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
+        int n = 0;
+        do {
+            n = ::recv(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0);
+        } while (n < 0 && detail::is_eintr(detail::get_last_error()));
+
+        if (n > 0) {
+            handler(std::span<const uint8_t>{buf_, static_cast<size_t>(n)});
+            return true;
+        }
+        return false;
+    }
+
+    template <UdpPacketHandler Handler>
+    [[nodiscard]] bool recvFrom(Handler handler) {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
+        Endpoint peer_ep;
+        socklen_t addrlen = sizeof(peer_ep.raw);
+        int n = 0;
+        do {
+            n = ::recvfrom(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0,
+                           reinterpret_cast<struct sockaddr*>(&peer_ep.raw), &addrlen);
+        } while (n < 0 && detail::is_eintr(detail::get_last_error()));
+
+        if (n > 0) {
+            handler(std::span<const uint8_t>{buf_, static_cast<size_t>(n)}, peer_ep);
+            return true;
+        }
+        return false;
+    }
+
+    template <size_t MaxBatch = 16, UdpDataHandler Handler>
+    [[nodiscard]] size_t recvBatch(Handler handler) {
+        return recvBatchImpl<MaxBatch, false>(handler);
+    }
+
+    template <size_t MaxBatch = 16, UdpPacketHandler Handler>
+    [[nodiscard]] size_t recvFromBatch(Handler handler) {
+        return recvBatchImpl<MaxBatch, true>(handler);
     }
 
    private:
-    detail::UdpSocketBase base_;
+    [[nodiscard]] size_t sendBatchImpl(std::span<const IoSlice> packets,
+                                       const Endpoint* dst) noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD || packets.empty()) return 0;
+#ifdef __linux__
+        constexpr size_t kBatchSize = 64;
+        size_t total_sent = 0;
+        size_t offset = 0;
+        while (offset < packets.size()) {
+            size_t count = std::min(kBatchSize, packets.size() - offset);
+            struct mmsghdr msgs[kBatchSize]{};
+            struct iovec iovs[kBatchSize]{};
+            for (size_t i = 0; i < count; ++i) {
+                const auto& pkt = packets[offset + i];
+                iovs[i].iov_base = const_cast<void*>(pkt.data);
+                iovs[i].iov_len = pkt.size;
+                msgs[i].msg_hdr.msg_iov = &iovs[i];
+                msgs[i].msg_hdr.msg_iovlen = 1;
+                if (dst != nullptr) {
+                    msgs[i].msg_hdr.msg_name = const_cast<sockaddr_in*>(&dst->raw);
+                    msgs[i].msg_hdr.msg_namelen = sizeof(dst->raw);
+                }
+            }
+            int ret = 0;
+            do {
+                ret = ::sendmmsg(fd_, msgs, static_cast<unsigned int>(count), MSG_DONTWAIT);
+            } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
+            if (ret <= 0) break;
+            total_sent += static_cast<size_t>(ret);
+            if (static_cast<size_t>(ret) < count) break;
+            offset += count;
+        }
+        return total_sent;
+#else
+        size_t total_sent = 0;
+        for (const auto& pkt : packets) {
+            bool ok = (dst != nullptr) ? sendTo(pkt.data, pkt.size, *dst)
+                                       : send(pkt.data, pkt.size);
+            if (!ok) break;
+            ++total_sent;
+        }
+        return total_sent;
+#endif
+    }
+
+    template <size_t MaxBatch, bool WantPeer, typename Handler>
+    [[nodiscard]] size_t recvBatchImpl(Handler& handler) {
+        static_assert(MaxBatch > 0 && MaxBatch <= 64, "MaxBatch must be in [1, 64]");
+        static_assert(MaxBatch * RecvBufSize <= 256 * 1024, "Batch stack buffer exceeds 256 KiB");
+        if (fd_ == detail::INVALID_SOCKET_FD) return 0;
+
+#ifdef __linux__
+        alignas(16) uint8_t batch_buf[MaxBatch][RecvBufSize];
+        struct mmsghdr msgs[MaxBatch]{};
+        struct iovec iovs[MaxBatch]{};
+        Endpoint peers[MaxBatch]{};
+
+        for (size_t i = 0; i < MaxBatch; ++i) {
+            iovs[i].iov_base = batch_buf[i];
+            iovs[i].iov_len = RecvBufSize;
+            msgs[i].msg_hdr.msg_iov = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            if constexpr (WantPeer) {
+                msgs[i].msg_hdr.msg_name = &peers[i].raw;
+                msgs[i].msg_hdr.msg_namelen = sizeof(peers[i].raw);
+            }
+        }
+
+        int n = 0;
+        do {
+            n = ::recvmmsg(fd_, msgs, static_cast<unsigned int>(MaxBatch), MSG_DONTWAIT, nullptr);
+        } while (n < 0 && detail::is_eintr(detail::get_last_error()));
+
+        if (n <= 0) return 0;
+
+        for (int i = 0; i < n; ++i) {
+            size_t len = static_cast<size_t>(msgs[i].msg_len);
+            if (len > RecvBufSize) len = RecvBufSize;
+            if constexpr (WantPeer) {
+                handler(std::span<const uint8_t>{batch_buf[i], len}, peers[i]);
+            } else {
+                handler(std::span<const uint8_t>{batch_buf[i], len});
+            }
+        }
+        return static_cast<size_t>(n);
+#else
+        size_t count = 0;
+        for (; count < MaxBatch; ++count) {
+            bool ok = false;
+            if constexpr (WantPeer) {
+                ok = recvFrom(handler);
+            } else {
+                ok = recv(handler);
+            }
+            if (!ok) break;
+        }
+        return count;
+#endif
+    }
+
+    void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
+        detail::format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
+    }
+
+    detail::socket_t fd_ = detail::INVALID_SOCKET_FD;
+    uint8_t buf_[RecvBufSize];
+    char last_error_[128] = "";
 };
 
 // ==========================================
@@ -1560,10 +1384,5 @@ using TcpServer = SocketTcpServer<UserData, RecvBufSize, MaxConns>;
 
 template <size_t RecvBufSize = 1500>
 using UdpSocket = SocketUdpSocket<RecvBufSize>;
-
-template <size_t RecvBufSize = 1500>
-using UdpReceiver = SocketUdpReceiver<RecvBufSize>;
-
-using UdpSender = SocketUdpSender;
 
 }  // namespace pollnet

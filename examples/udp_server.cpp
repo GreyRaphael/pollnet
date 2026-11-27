@@ -22,7 +22,7 @@ struct MsgHeader {
 int main() {
     std::signal(SIGINT, handle_signal);
 
-    pollnet::UdpReceiver<> server;
+    pollnet::UdpSocket<> server;
     if (!server.open({.bind_ip = "127.0.0.1", .bind_port = 1234})) {
         std::cout << std::format("open failed: {}\n", server.lastError());
         return 1;

@@ -78,7 +78,7 @@ class EchoHandler {
             rsp_header.body_len = htonl(static_cast<uint32_t>(result.size()));
 
             std::array<pollnet::IoSlice, 2> iov{{{&rsp_header, sizeof(MsgHeader)}, {result}}};
-            if (!conn.writevNonblock(iov)) {
+            if (!conn.writeNonblock(iov)) {
                 return data.size();
             }
 

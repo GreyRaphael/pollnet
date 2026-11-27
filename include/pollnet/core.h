@@ -29,9 +29,11 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace pollnet {
 
@@ -209,10 +211,17 @@ struct Endpoint {
 };
 
 // ==========================================
-// 后端无关配置项 (Options & UserData)
+// 后端无关配置项与视图 (Options & IoSlice)
 // ==========================================
 
 struct EmptyUserData {};
+
+template <typename R>
+concept ByteRange = std::ranges::contiguous_range<R> && std::ranges::sized_range<R> &&
+                    !std::is_array_v<std::remove_cvref_t<R>> &&
+                    (std::same_as<std::remove_cv_t<std::ranges::range_value_t<R>>, uint8_t> ||
+                     std::same_as<std::remove_cv_t<std::ranges::range_value_t<R>>, std::byte> ||
+                     std::same_as<std::remove_cv_t<std::ranges::range_value_t<R>>, char>);
 
 struct IoSlice {
     const void* data = nullptr;
@@ -220,9 +229,11 @@ struct IoSlice {
 
     constexpr IoSlice() noexcept = default;
     constexpr IoSlice(const void* ptr, size_t len) noexcept : data(ptr), size(len) {}
-    IoSlice(std::span<const uint8_t> s) noexcept : data(s.data()), size(s.size()) {}
-    IoSlice(std::span<const std::byte> s) noexcept : data(s.data()), size(s.size()) {}
-    IoSlice(std::string_view s) noexcept : data(s.data()), size(s.size()) {}
+
+    template <ByteRange R>
+        requires(!std::same_as<std::remove_cvref_t<R>, IoSlice>)
+    IoSlice(const R& range) noexcept
+        : data(std::ranges::data(range)), size(std::ranges::size(range)) {}
 };
 
 struct TcpClientOptions {
@@ -254,29 +265,7 @@ struct TcpServerOptions {
     int send_buf_bytes = 0;
 };
 
-struct UdpReceiverOptions {
-    std::string_view bind_ip{"0.0.0.0"};
-    uint16_t bind_port = 0;
-    std::string_view multicast_interface_ip{};
-    std::string_view interface{};
-    int busy_poll_us = 0;
-    int recv_buf_bytes = 0;
-    int send_buf_bytes = 0;
-};
-
-struct UdpSenderOptions {
-    std::string_view local_ip{"0.0.0.0"};
-    uint16_t local_port = 0;
-    std::string_view dest_ip{};
-    uint16_t dest_port = 0;
-    std::string_view interface{};
-    int multicast_ttl = 64;
-    int busy_poll_us = 0;
-    int recv_buf_bytes = 0;
-    int send_buf_bytes = 0;
-};
-
-struct UdpSocketOptions {
+struct UdpOptions {
     std::string_view bind_ip{"0.0.0.0"};
     uint16_t bind_port = 0;
     std::string_view dest_ip{};
@@ -295,13 +284,15 @@ struct UdpSocketOptions {
 // ==========================================
 
 template <typename Conn>
-concept TcpConnectionLike = requires(Conn& conn, const Conn& cconn, std::span<const uint8_t> bytes,
-                                     const char* reason) {
+concept TcpConnectionLike = requires(Conn& conn, const Conn& cconn, IoSlice slice,
+                                     std::span<const IoSlice> slices, const char* reason) {
     { cconn.isConnected() } -> std::convertible_to<bool>;
     { cconn.lastError() } -> std::convertible_to<std::string_view>;
     { cconn.peer() } -> std::same_as<std::optional<Endpoint>>;
-    { conn.writeSome(bytes) } -> std::convertible_to<int>;
-    { conn.writeNonblock(bytes) } -> std::convertible_to<bool>;
+    { conn.writeSome(slice) } -> std::convertible_to<int>;
+    { conn.writeSome(slices) } -> std::convertible_to<int>;
+    { conn.writeNonblock(slice) } -> std::convertible_to<bool>;
+    { conn.writeNonblock(slices) } -> std::convertible_to<bool>;
     conn.close(reason);
 };
 

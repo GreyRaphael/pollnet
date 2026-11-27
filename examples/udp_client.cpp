@@ -15,9 +15,9 @@ struct MsgHeader {
 };
 
 int main() {
-    pollnet::UdpSender client;
-    if (!client.open({.local_ip = "127.0.0.1",
-                      .local_port = 4321,
+    pollnet::UdpSocket<> client;
+    if (!client.open({.bind_ip = "127.0.0.1",
+                      .bind_port = 4321,
                       .dest_ip = "127.0.0.1",
                       .dest_port = 1234})) {
         std::cout << std::format("open error: {}\n", client.lastError());

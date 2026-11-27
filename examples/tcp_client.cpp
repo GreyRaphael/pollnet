@@ -44,8 +44,8 @@ class ClientHandler {
                 {&header, sizeof(MsgHeader)},
                 {msg},
             }};
-            if (!conn.writev(iov)) {
-                std::cout << std::format("writev error: {}\n", conn.lastError());
+            if (!conn.write(iov)) {
+                std::cout << std::format("write error: {}\n", conn.lastError());
             }
         }
         is_first_ = false;

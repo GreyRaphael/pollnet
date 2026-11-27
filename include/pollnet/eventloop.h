@@ -8,13 +8,11 @@
 #include <poll.h>
 #endif
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string_view>
-#include <utility>
 
 namespace pollnet {
 
@@ -39,58 +37,20 @@ class EventLoopTcpServer {
         closeAllConnections("reinit");
         close("reinit");
 
-        if (!detail::ensure_network_init()) {
-            saveError("WSAStartup failed", false);
-            return false;
-        }
-
-        auto ep = Endpoint::from(opts.host, opts.port);
-        if (!ep) {
-            saveError("invalid host", false);
-            return false;
-        }
-
-        listenfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listenfd_ == detail::INVALID_SOCKET_FD) {
-            saveError("socket error", true);
-            return false;
-        }
-
-        if (!detail::set_nonblocking(listenfd_)) {
-            close("set nonblock error", true);
-            return false;
-        }
-
-        int yes = 1;
-        if (::setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR,
-                         reinterpret_cast<detail::sockopt_val_t>(&yes), sizeof(yes)) < 0) {
-            close("setsockopt SO_REUSEADDR error", true);
-            return false;
-        }
-
-        detail::apply_socket_tuning(listenfd_, true, opts.recv_buf_bytes, opts.send_buf_bytes,
-                                    opts.busy_poll_us, opts.tcp_quickack);
-
-        if (::bind(listenfd_, reinterpret_cast<const struct sockaddr*>(&ep->raw), sizeof(ep->raw)) <
-            0) {
-            close("bind error", true);
-            return false;
-        }
-
-        int backlog = (opts.backlog > 0) ? opts.backlog : 128;
-        if (::listen(listenfd_, backlog) < 0) {
-            close("listen error", true);
+        if (!listener_.listen(opts)) {
             return false;
         }
 
 #ifdef __linux__
         epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
         if (epoll_fd_ < 0) {
-            close("epoll_create1 error", true);
+            listener_.close("epoll_create1 error", true);
             return false;
         }
         if (!armListen(true)) {
-            close("epoll_ctl listen error", true);
+            listener_.close("epoll_ctl listen error", true);
+            ::close(epoll_fd_);
+            epoll_fd_ = -1;
             return false;
         }
 #endif
@@ -105,17 +65,13 @@ class EventLoopTcpServer {
     }
 
     void close(const char* reason, bool check_errno = false, int err_override = 0) noexcept {
-        if (listenfd_ != detail::INVALID_SOCKET_FD) {
-            saveError(reason, check_errno, err_override);
 #ifdef __linux__
-            if (epoll_fd_ >= 0 && listen_armed_) {
-                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listenfd_, nullptr);
-                listen_armed_ = false;
-            }
-#endif
-            detail::close_socket(listenfd_);
-            listenfd_ = detail::INVALID_SOCKET_FD;
+        if (epoll_fd_ >= 0 && listen_armed_ && !listener_.isClosed()) {
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listener_.fd(), nullptr);
+            listen_armed_ = false;
         }
+#endif
+        listener_.close(reason, check_errno, err_override);
 #ifdef __linux__
         if (epoll_fd_ >= 0) {
             ::close(epoll_fd_);
@@ -125,23 +81,10 @@ class EventLoopTcpServer {
 #endif
     }
 
-    [[nodiscard]] std::string_view lastError() const noexcept { return last_error_; }
-
-    [[nodiscard]] bool isClosed() const noexcept {
-        return listenfd_ == detail::INVALID_SOCKET_FD;
-    }
-
+    [[nodiscard]] std::string_view lastError() const noexcept { return listener_.lastError(); }
+    [[nodiscard]] bool isClosed() const noexcept { return listener_.isClosed(); }
     [[nodiscard]] size_t connCount() const noexcept { return active_cnt_; }
-
-    [[nodiscard]] uint16_t localPort() const noexcept {
-        if (listenfd_ == detail::INVALID_SOCKET_FD) return 0;
-        struct sockaddr_in addr{};
-        socklen_t addrlen = sizeof(addr);
-        if (::getsockname(listenfd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
-            return 0;
-        }
-        return ntohs(addr.sin_port);
-    }
+    [[nodiscard]] uint16_t localPort() const noexcept { return listener_.localPort(); }
 
     template <typename Handler>
         requires std::invocable<Handler&, Conn&>
@@ -166,7 +109,7 @@ class EventLoopTcpServer {
    private:
     template <typename Handler>
     void pollImpl(Handler& handler, int timeout_ms, bool use_sys_clock, int64_t now) {
-        if (isClosed() && active_cnt_ == 0) return;
+        if (listener_.isClosed() && active_cnt_ == 0) return;
 
 #ifdef __linux__
         if (epoll_fd_ < 0) return;
@@ -189,24 +132,7 @@ class EventLoopTcpServer {
                 acceptReady(handler, now);
                 continue;
             }
-
-            size_t slot = static_cast<size_t>(token);
-            if (slot >= MaxConns || !slot_active_[slot]) continue;
-
-            Conn& c = conns_data_[slot];
-            bool got_data = c.read([&](std::span<const uint8_t> buf) {
-                return static_cast<size_t>(handler.onData(c, buf));
-            });
-            if (got_data && recv_timeout_ns_ > 0) {
-                c.recv_ts_ = now;
-            }
-            if (c.isConnected() && (ev_mask & EPOLLERR)) {
-                c.close("epoll error", false);
-            }
-            if (!c.isConnected()) {
-                releaseSlot(slot);
-                detail::dispatch_disconnect(handler, c);
-            }
+            handleActiveSlot(handler, static_cast<size_t>(token), (ev_mask & EPOLLERR) != 0, now);
         }
 #else
 #ifdef _WIN32
@@ -220,8 +146,8 @@ class EventLoopTcpServer {
         std::array<uint32_t, MaxConns + 1> tokens{};
         size_t nfds = 0;
 
-        if (!isClosed() && free_top_ > 0) {
-            pfds[nfds].fd = listenfd_;
+        if (!listener_.isClosed() && free_top_ > 0) {
+            pfds[nfds].fd = listener_.fd();
             pfds[nfds].events = kPollRead;
             pfds[nfds].revents = 0;
             tokens[nfds] = kListenToken;
@@ -259,23 +185,7 @@ class EventLoopTcpServer {
                     acceptReady(handler, now);
                     continue;
                 }
-                size_t slot = static_cast<size_t>(token);
-                if (slot >= MaxConns || !slot_active_[slot]) continue;
-
-                Conn& c = conns_data_[slot];
-                bool got_data = c.read([&](std::span<const uint8_t> buf) {
-                    return static_cast<size_t>(handler.onData(c, buf));
-                });
-                if (got_data && recv_timeout_ns_ > 0) {
-                    c.recv_ts_ = now;
-                }
-                if (c.isConnected() && (rev & POLLERR)) {
-                    c.close("poll error", false);
-                }
-                if (!c.isConnected()) {
-                    releaseSlot(slot);
-                    detail::dispatch_disconnect(handler, c);
-                }
+                handleActiveSlot(handler, static_cast<size_t>(token), (rev & POLLERR) != 0, now);
             }
         }
 #endif
@@ -300,26 +210,23 @@ class EventLoopTcpServer {
 
     void closeAllConnections(const char* reason) noexcept {
         for (size_t i = active_cnt_; i > 0; --i) {
-            size_t slot = active_slots_[i - 1];
-            conns_data_[slot].close(reason);
+            conns_data_[active_slots_[i - 1]].close(reason);
         }
         resetSlots();
     }
 
 #ifdef __linux__
     [[nodiscard]] bool armListen(bool enable) noexcept {
-        if (epoll_fd_ < 0 || isClosed()) return false;
+        if (epoll_fd_ < 0 || listener_.isClosed()) return false;
         if (enable == listen_armed_) return true;
         if (enable) {
             struct epoll_event ev{};
             ev.events = EPOLLIN;
             ev.data.u32 = kListenToken;
-            if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listenfd_, &ev) < 0) {
-                return false;
-            }
+            if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listener_.fd(), &ev) < 0) return false;
             listen_armed_ = true;
         } else {
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listenfd_, nullptr);
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listener_.fd(), nullptr);
             listen_armed_ = false;
         }
         return true;
@@ -327,17 +234,32 @@ class EventLoopTcpServer {
 #endif
 
     template <typename Handler>
+    void handleActiveSlot(Handler& handler, size_t slot, bool has_err, int64_t now) {
+        if (slot >= MaxConns || !slot_active_[slot]) return;
+        Conn& c = conns_data_[slot];
+        bool got_data = c.read([&](std::span<const uint8_t> buf) {
+            return static_cast<size_t>(handler.onData(c, buf));
+        });
+        if (got_data && recv_timeout_ns_ > 0) {
+            c.recv_ts_ = now;
+        }
+        if (c.isConnected() && has_err) {
+            c.close("eventloop error", false);
+        }
+        if (!c.isConnected()) {
+            releaseSlot(slot);
+            detail::dispatch_disconnect(handler, c);
+        }
+    }
+
+    template <typename Handler>
     void acceptReady(Handler& handler, int64_t now) {
-        while (!isClosed() && free_top_ > 0) {
-            struct sockaddr_in clientaddr{};
-            socklen_t addr_len = sizeof(clientaddr);
-            detail::socket_t fd =
-                ::accept(listenfd_, reinterpret_cast<struct sockaddr*>(&clientaddr), &addr_len);
-            if (fd == detail::INVALID_SOCKET_FD) {
-                if (detail::is_eintr(detail::get_last_error())) continue;
-                break;
-            }
-            if (!detail::dispatch_allow_new_connection(handler, Endpoint(clientaddr))) {
+        while (!listener_.isClosed() && free_top_ > 0) {
+            Endpoint peer_ep;
+            detail::socket_t fd = listener_.acceptOne(peer_ep);
+            if (fd == detail::INVALID_SOCKET_FD) break;
+
+            if (!detail::dispatch_allow_new_connection(handler, peer_ep)) {
                 detail::close_socket(fd);
                 continue;
             }
@@ -383,7 +305,7 @@ class EventLoopTcpServer {
         }
         free_slots_[free_top_++] = slot;
 #ifdef __linux__
-        if (!isClosed() && !listen_armed_) {
+        if (!listener_.isClosed() && !listen_armed_) {
             (void)armListen(true);
         }
 #endif
@@ -409,11 +331,7 @@ class EventLoopTcpServer {
         }
     }
 
-    void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
-        detail::format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
-    }
-
-    detail::socket_t listenfd_ = detail::INVALID_SOCKET_FD;
+    detail::TcpListener listener_;
 #ifdef __linux__
     int epoll_fd_ = -1;
     bool listen_armed_ = false;
@@ -431,7 +349,6 @@ class EventLoopTcpServer {
     size_t free_slots_[MaxConns]{};
     bool slot_active_[MaxConns]{};
     Conn conns_data_[MaxConns];
-    char last_error_[128] = "";
 };
 
 }  // namespace pollnet
