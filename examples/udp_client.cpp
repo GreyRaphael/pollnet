@@ -15,9 +15,12 @@ struct MsgHeader {
 };
 
 int main() {
-    pollnet::SocketUdpSender client;
-    if (!client.init("", "127.0.0.1", 4321, "127.0.0.1", 1234)) {
-        std::cout << std::format("init error: {}\n", client.getLastError());
+    pollnet::UdpSender client;
+    if (!client.open({.local_ip = "127.0.0.1",
+                      .local_port = 4321,
+                      .dest_ip = "127.0.0.1",
+                      .dest_port = 1234})) {
+        std::cout << std::format("open error: {}\n", client.lastError());
         return 1;
     }
 
@@ -43,8 +46,8 @@ int main() {
         }
         std::cout << '\n';
 
-        if (!client.write(std::span<const uint8_t>{send_buf.data(), total_len})) {
-            std::cout << std::format("send failed: {}\n", client.getLastError());
+        if (!client.send(std::span<const uint8_t>{send_buf.data(), total_len})) {
+            std::cout << std::format("send failed: {}\n", client.lastError());
         }
     }
 
