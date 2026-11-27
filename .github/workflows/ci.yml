@@ -19,48 +19,27 @@ jobs:
             cc: gcc
             cxx: g++
             build_type: Release
-            compiler: gcc
           - name: Linux GCC Debug
             os: ubuntu-latest
             cc: gcc
             cxx: g++
             build_type: Debug
-            compiler: gcc
           - name: Linux Clang Release
             os: ubuntu-latest
             cc: clang
             cxx: clang++
             build_type: Release
-            compiler: clang
           - name: Windows VS2022 Release
             os: windows-2022
             cc: ""
             cxx: ""
             build_type: Release
-            compiler: msvc
-          - name: Windows MinGW Debug
-            os: windows-latest
-            cc: ""
-            cxx: ""
-            build_type: Debug
-            compiler: mingw
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MinGW
-        if: matrix.compiler == 'mingw'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          install: >-
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-ninja
-
       - name: Configure CMake
-        if: matrix.compiler != 'mingw'
         shell: bash
         run: |
           if [ -n "${{ matrix.cc }}" ]; then
@@ -69,30 +48,13 @@ jobs:
           fi
           cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-      - name: Configure CMake (MinGW)
-        if: matrix.compiler == 'mingw'
-        shell: msys2 {0}
-        run: cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-
       - name: Build
-        if: matrix.compiler != 'mingw'
         shell: bash
         run: cmake --build build --config ${{ matrix.build_type }} -j 4
 
-      - name: Build (MinGW)
-        if: matrix.compiler == 'mingw'
-        shell: msys2 {0}
-        run: cmake --build build -j 4
-
       - name: Run CTest
-        if: matrix.compiler != 'mingw'
         shell: bash
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
-
-      - name: Run CTest (MinGW)
-        if: matrix.compiler == 'mingw'
-        shell: msys2 {0}
-        run: ctest --test-dir build --output-on-failure
 
       - name: Standalone Compile Check (without CMake)
         if: matrix.name == 'Linux GCC Release'

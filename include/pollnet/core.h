@@ -7,6 +7,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -240,7 +243,7 @@ struct TcpClientOptions {
     std::string_view host{};
     uint16_t port = 0;
     uint16_t local_port = 0;
-    std::string_view interface{};
+    std::string_view iface{};
     std::chrono::milliseconds retry_interval{3000};
     std::chrono::milliseconds connect_timeout{5000};
     std::chrono::milliseconds send_timeout{0};
@@ -254,7 +257,7 @@ struct TcpClientOptions {
 struct TcpServerOptions {
     std::string_view host{"0.0.0.0"};
     uint16_t port = 0;
-    std::string_view interface{};
+    std::string_view iface{};
     int backlog = 128;
     std::chrono::milliseconds send_timeout{0};
     std::chrono::milliseconds recv_timeout{0};
@@ -272,7 +275,7 @@ struct UdpOptions {
     uint16_t dest_port = 0;
     std::string_view multicast_group_ip{};
     std::string_view multicast_interface_ip{};
-    std::string_view interface{};
+    std::string_view iface{};
     int multicast_ttl = 64;
     int busy_poll_us = 0;
     int recv_buf_bytes = 0;
