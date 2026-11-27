@@ -779,6 +779,12 @@ class SocketTcpConnection : public UserData {
     template <typename, size_t, size_t>
     friend class SocketTcpServer;
 
+    template <typename, size_t, size_t>
+    friend class EventLoopTcpServer;
+
+    template <typename, size_t, size_t>
+    friend class IoUringTcpServer;
+
     template <typename Handler>
     void pollConn(int64_t now, Handler& handler) {
         if (send_timeout_ns_ > 0 && now - send_ts_ >= send_timeout_ns_) {
