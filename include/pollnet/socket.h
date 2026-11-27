@@ -519,15 +519,18 @@ class SocketTcpConnection : public UserData {
         size_t remaining = avail - consumed;
         if (remaining == 0) {
             head_ = tail_ = 0;
-        } else {
+        } else if (remaining < RecvBufSize) {
             head_ += consumed;
-            if (head_ >= RecvBufSize / 2 || (tail_ == RecvBufSize && head_ > 0)) {
+            if ((head_ >= RecvBufSize / 2 || tail_ == RecvBufSize) && head_ > 0 &&
+                head_ + remaining <= RecvBufSize) {
                 std::memmove(recvbuf_, recvbuf_ + head_, remaining);
                 head_ = 0;
                 tail_ = remaining;
             } else if (tail_ == RecvBufSize) {
                 close("recv buf full", false);
             }
+        } else {
+            close("recv buf full", false);
         }
         return true;
     }
