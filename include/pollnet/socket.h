@@ -47,6 +47,37 @@ inline void disable_udp_connreset(socket_t fd) noexcept {
 }
 #endif
 
+inline void set_tcp_quickack(socket_t fd) noexcept {
+#if defined(__linux__) && defined(TCP_QUICKACK)
+    int qa = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &qa, sizeof(qa));
+#else
+    (void)fd;
+#endif
+}
+
+inline void apply_socket_tuning(socket_t fd, bool is_tcp, int recv_buf_bytes, int send_buf_bytes,
+                                int busy_poll_us, bool tcp_quickack) noexcept {
+    if (recv_buf_bytes > 0) {
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<sockopt_val_t>(&recv_buf_bytes),
+                     sizeof(recv_buf_bytes));
+    }
+    if (send_buf_bytes > 0) {
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<sockopt_val_t>(&send_buf_bytes),
+                     sizeof(send_buf_bytes));
+    }
+#if defined(__linux__) && defined(SO_BUSY_POLL)
+    if (busy_poll_us > 0) {
+        ::setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
+    }
+#else
+    (void)busy_poll_us;
+#endif
+    if (is_tcp && tcp_quickack) {
+        set_tcp_quickack(fd);
+    }
+}
+
 // 非阻塞 connect 状态探测：返回 1 已连接，0 进行中，-1 失败（out_err 写入具体错误码）
 [[nodiscard]] inline int check_connect_status(socket_t fd, int& out_err) noexcept {
     out_err = 0;
@@ -181,6 +212,8 @@ class UdpSocketBase {
 #ifdef _WIN32
         disable_udp_connreset(fd_);
 #endif
+        apply_socket_tuning(fd_, false, opts.recv_buf_bytes, opts.send_buf_bytes, opts.busy_poll_us,
+                            false);
 
         if (reuse_addr) {
             int optval = 1;
@@ -504,6 +537,9 @@ class SocketTcpConnection : public UserData {
             return false;
         }
         tail_ += static_cast<size_t>(ret);
+        if (tcp_quickack_) {
+            detail::set_tcp_quickack(fd_);
+        }
 
         size_t avail = tail_ - head_;
         size_t consumed = handler(std::span<const uint8_t>{recvbuf_ + head_, avail});
@@ -535,14 +571,16 @@ class SocketTcpConnection : public UserData {
         return true;
     }
 
-    bool open(int64_t now, detail::socket_t fd, int64_t send_timeout_ns,
-              int64_t recv_timeout_ns) noexcept {
+    bool open(int64_t now, detail::socket_t fd, int64_t send_timeout_ns, int64_t recv_timeout_ns,
+              bool tcp_quickack = false, int recv_buf_bytes = 0, int send_buf_bytes = 0,
+              int busy_poll_us = 0) noexcept {
         fd_ = fd;
         head_ = tail_ = 0;
         send_ts_ = now;
         recv_ts_ = now;
         send_timeout_ns_ = send_timeout_ns;
         recv_timeout_ns_ = recv_timeout_ns;
+        tcp_quickack_ = tcp_quickack;
 
         if (!detail::set_nonblocking(fd_)) {
             close("set nonblock error", true);
@@ -556,6 +594,8 @@ class SocketTcpConnection : public UserData {
             return false;
         }
 
+        detail::apply_socket_tuning(fd_, true, recv_buf_bytes, send_buf_bytes, busy_poll_us,
+                                    tcp_quickack_);
         return true;
     }
 
@@ -564,13 +604,14 @@ class SocketTcpConnection : public UserData {
     }
 
     detail::socket_t fd_ = detail::INVALID_SOCKET_FD;
+    size_t head_ = 0;
+    size_t tail_ = 0;
     int64_t send_ts_ = 0;
     int64_t recv_ts_ = 0;
     int64_t send_timeout_ns_ = 0;
     int64_t recv_timeout_ns_ = 0;
-    size_t head_ = 0;
-    size_t tail_ = 0;
-    uint8_t recvbuf_[RecvBufSize]{};
+    bool tcp_quickack_ = false;
+    uint8_t recvbuf_[RecvBufSize];
     char last_error_[128] = "";
 };
 
@@ -601,6 +642,10 @@ class SocketTcpClient {
         connect_timeout_ns_ = 0;
         send_timeout_ns_ = 0;
         recv_timeout_ns_ = 0;
+        tcp_quickack_ = false;
+        busy_poll_us_ = 0;
+        recv_buf_bytes_ = 0;
+        send_buf_bytes_ = 0;
 
         if (!detail::ensure_network_init()) {
             conn_.saveError("WSAStartup failed", false);
@@ -619,6 +664,10 @@ class SocketTcpClient {
         connect_timeout_ns_ = detail::to_timeout_ns(opts.connect_timeout);
         send_timeout_ns_ = detail::to_timeout_ns(opts.send_timeout);
         recv_timeout_ns_ = detail::to_timeout_ns(opts.recv_timeout);
+        tcp_quickack_ = opts.tcp_quickack;
+        busy_poll_us_ = opts.busy_poll_us;
+        recv_buf_bytes_ = opts.recv_buf_bytes;
+        send_buf_bytes_ = opts.send_buf_bytes;
         initialized_ = true;
         return true;
     }
@@ -670,7 +719,9 @@ class SocketTcpClient {
     template <typename Handler>
         requires TcpHandler<Handler, Conn>
     void poll(Handler& handler) {
-        poll(handler, now_ns());
+        int64_t now =
+            (!conn_.isConnected() || send_timeout_ns_ > 0 || recv_timeout_ns_ > 0) ? now_ns() : 0;
+        poll(handler, now);
     }
 
     template <typename Handler>
@@ -734,11 +785,16 @@ class SocketTcpClient {
                 detail::close_socket(fd);
                 return -1;
             }
+            detail::apply_socket_tuning(fd, true, recv_buf_bytes_, send_buf_bytes_, busy_poll_us_,
+                                        tcp_quickack_);
 
             int ret =
                 ::connect(fd, reinterpret_cast<struct sockaddr*>(&server_addr_), sizeof(server_addr_));
             if (ret == 0) {
-                return conn_.open(now, fd, send_timeout_ns_, recv_timeout_ns_) ? 1 : -1;
+                return conn_.open(now, fd, send_timeout_ns_, recv_timeout_ns_, tcp_quickack_, 0, 0,
+                                  busy_poll_us_)
+                           ? 1
+                           : -1;
             }
 
             int err = detail::get_last_error();
@@ -758,7 +814,10 @@ class SocketTcpClient {
         if (status > 0) {
             detail::socket_t fd = conn_fd_;
             conn_fd_ = detail::INVALID_SOCKET_FD;
-            return conn_.open(now, fd, send_timeout_ns_, recv_timeout_ns_) ? 1 : -1;
+            return conn_.open(now, fd, send_timeout_ns_, recv_timeout_ns_, tcp_quickack_, 0, 0,
+                              busy_poll_us_)
+                       ? 1
+                       : -1;
         }
         if (status < 0) {
             conn_.saveError("connect error", true, conn_err);
@@ -786,6 +845,10 @@ class SocketTcpClient {
     int64_t recv_timeout_ns_ = 0;
     struct sockaddr_in server_addr_{};
     uint16_t local_port_be_ = 0;
+    bool tcp_quickack_ = false;
+    int busy_poll_us_ = 0;
+    int recv_buf_bytes_ = 0;
+    int send_buf_bytes_ = 0;
 };
 
 template <typename UserData = EmptyUserData, size_t RecvBufSize = 4096, size_t MaxConns = 64>
@@ -841,6 +904,9 @@ class SocketTcpServer {
             return false;
         }
 
+        detail::apply_socket_tuning(listenfd_, true, opts.recv_buf_bytes, opts.send_buf_bytes,
+                                    opts.busy_poll_us, opts.tcp_quickack);
+
         if (::bind(listenfd_, reinterpret_cast<const struct sockaddr*>(&ep->raw), sizeof(ep->raw)) <
             0) {
             close("bind error", true);
@@ -855,6 +921,12 @@ class SocketTcpServer {
 
         send_timeout_ns_ = detail::to_timeout_ns(opts.send_timeout);
         recv_timeout_ns_ = detail::to_timeout_ns(opts.recv_timeout);
+        accept_poll_interval_ = opts.accept_poll_interval;
+        accept_poll_counter_ = 0;
+        tcp_quickack_ = opts.tcp_quickack;
+        busy_poll_us_ = opts.busy_poll_us;
+        recv_buf_bytes_ = opts.recv_buf_bytes;
+        send_buf_bytes_ = opts.send_buf_bytes;
         return true;
     }
 
@@ -896,13 +968,23 @@ class SocketTcpServer {
     template <typename Handler>
         requires TcpHandler<Handler, Conn>
     void poll(Handler& handler) {
-        poll(handler, now_ns());
+        int64_t now = (send_timeout_ns_ > 0 || recv_timeout_ns_ > 0) ? now_ns() : 0;
+        poll(handler, now);
     }
 
     template <typename Handler>
         requires TcpHandler<Handler, Conn>
     void poll(Handler& handler, int64_t now) {
-        while (!isClosed() && conns_cnt_ < MaxConns) {
+        bool check_accept = false;
+        if (!isClosed() && conns_cnt_ < MaxConns) {
+            if (conns_cnt_ == 0 || accept_poll_interval_ <= 1) {
+                check_accept = true;
+            } else if (++accept_poll_counter_ >= accept_poll_interval_) {
+                accept_poll_counter_ = 0;
+                check_accept = true;
+            }
+        }
+        while (check_accept && !isClosed() && conns_cnt_ < MaxConns) {
             struct sockaddr_in clientaddr{};
             socklen_t addr_len = sizeof(clientaddr);
             detail::socket_t fd =
@@ -916,7 +998,8 @@ class SocketTcpServer {
                 continue;
             }
             Conn& c = *conns_[conns_cnt_];
-            if (c.open(now, fd, send_timeout_ns_, recv_timeout_ns_)) {
+            if (c.open(now, fd, send_timeout_ns_, recv_timeout_ns_, tcp_quickack_, recv_buf_bytes_,
+                       send_buf_bytes_, busy_poll_us_)) {
                 conns_cnt_++;
                 detail::dispatch_connect(handler, c);
             }
@@ -928,6 +1011,7 @@ class SocketTcpServer {
                 i++;
             } else {
                 std::swap(conns_[i], conns_[--conns_cnt_]);
+                accept_poll_counter_ = accept_poll_interval_;
                 detail::dispatch_disconnect(handler, c);
             }
         }
@@ -940,8 +1024,14 @@ class SocketTcpServer {
 
     detail::socket_t listenfd_ = detail::INVALID_SOCKET_FD;
     size_t conns_cnt_ = 0;
+    uint32_t accept_poll_interval_ = 64;
+    uint32_t accept_poll_counter_ = 0;
     int64_t send_timeout_ns_ = 0;
     int64_t recv_timeout_ns_ = 0;
+    bool tcp_quickack_ = false;
+    int busy_poll_us_ = 0;
+    int recv_buf_bytes_ = 0;
+    int send_buf_bytes_ = 0;
     Conn* conns_[MaxConns]{};
     Conn conns_data_[MaxConns];
     char last_error_[128] = "";
@@ -1007,7 +1097,7 @@ class SocketUdpSocket {
 
    private:
     detail::UdpSocketBase base_;
-    uint8_t buf_[RecvBufSize]{};
+    uint8_t buf_[RecvBufSize];
 };
 
 template <size_t RecvBufSize = 1500>
@@ -1028,6 +1118,9 @@ class SocketUdpReceiver {
         sock_opts.bind_ip = opts.bind_ip;
         sock_opts.bind_port = opts.bind_port;
         sock_opts.interface = opts.interface;
+        sock_opts.busy_poll_us = opts.busy_poll_us;
+        sock_opts.recv_buf_bytes = opts.recv_buf_bytes;
+        sock_opts.send_buf_bytes = opts.send_buf_bytes;
         if (!opts.multicast_interface_ip.empty()) {
             sock_opts.multicast_group_ip = opts.bind_ip;
             sock_opts.multicast_interface_ip = opts.multicast_interface_ip;
@@ -1064,7 +1157,7 @@ class SocketUdpReceiver {
 
    private:
     detail::UdpSocketBase base_;
-    uint8_t buf_[RecvBufSize]{};
+    uint8_t buf_[RecvBufSize];
 };
 
 class SocketUdpSender {
@@ -1088,6 +1181,9 @@ class SocketUdpSender {
         sock_opts.dest_port = opts.dest_port;
         sock_opts.interface = opts.interface;
         sock_opts.multicast_ttl = opts.multicast_ttl;
+        sock_opts.busy_poll_us = opts.busy_poll_us;
+        sock_opts.recv_buf_bytes = opts.recv_buf_bytes;
+        sock_opts.send_buf_bytes = opts.send_buf_bytes;
         return base_.openSocket(sock_opts, false);
     }
 

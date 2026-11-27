@@ -214,6 +214,17 @@ struct Endpoint {
 
 struct EmptyUserData {};
 
+struct IoSlice {
+    const void* data = nullptr;
+    size_t size = 0;
+
+    constexpr IoSlice() noexcept = default;
+    constexpr IoSlice(const void* ptr, size_t len) noexcept : data(ptr), size(len) {}
+    IoSlice(std::span<const uint8_t> s) noexcept : data(s.data()), size(s.size()) {}
+    IoSlice(std::span<const std::byte> s) noexcept : data(s.data()), size(s.size()) {}
+    IoSlice(std::string_view s) noexcept : data(s.data()), size(s.size()) {}
+};
+
 struct TcpClientOptions {
     std::string_view host{};
     uint16_t port = 0;
@@ -223,6 +234,10 @@ struct TcpClientOptions {
     std::chrono::milliseconds connect_timeout{5000};
     std::chrono::milliseconds send_timeout{0};
     std::chrono::milliseconds recv_timeout{0};
+    bool tcp_quickack = false;
+    int busy_poll_us = 0;
+    int recv_buf_bytes = 0;
+    int send_buf_bytes = 0;
 };
 
 struct TcpServerOptions {
@@ -232,6 +247,11 @@ struct TcpServerOptions {
     int backlog = 128;
     std::chrono::milliseconds send_timeout{0};
     std::chrono::milliseconds recv_timeout{0};
+    uint32_t accept_poll_interval = 64;
+    bool tcp_quickack = false;
+    int busy_poll_us = 0;
+    int recv_buf_bytes = 0;
+    int send_buf_bytes = 0;
 };
 
 struct UdpReceiverOptions {
@@ -239,6 +259,9 @@ struct UdpReceiverOptions {
     uint16_t bind_port = 0;
     std::string_view multicast_interface_ip{};
     std::string_view interface{};
+    int busy_poll_us = 0;
+    int recv_buf_bytes = 0;
+    int send_buf_bytes = 0;
 };
 
 struct UdpSenderOptions {
@@ -248,6 +271,9 @@ struct UdpSenderOptions {
     uint16_t dest_port = 0;
     std::string_view interface{};
     int multicast_ttl = 64;
+    int busy_poll_us = 0;
+    int recv_buf_bytes = 0;
+    int send_buf_bytes = 0;
 };
 
 struct UdpSocketOptions {
@@ -259,6 +285,9 @@ struct UdpSocketOptions {
     std::string_view multicast_interface_ip{};
     std::string_view interface{};
     int multicast_ttl = 64;
+    int busy_poll_us = 0;
+    int recv_buf_bytes = 0;
+    int send_buf_bytes = 0;
 };
 
 // ==========================================
