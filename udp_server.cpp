@@ -1,39 +1,67 @@
-#include <print>
+#include <atomic>
+#include <csignal>
+#include <cstdint>
+#include <cstring>
+#include <format>
+#include <iostream>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "socket.h"
 
+namespace {
+std::atomic<bool> g_running{true};
+void handle_signal(int) { g_running.store(false, std::memory_order_relaxed); }
+
+std::string addr_to_string(const sockaddr_in& addr) {
+    char buf[INET_ADDRSTRLEN]{};
+    if (::inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)) == nullptr) {
+        return "<invalid>";
+    }
+    return buf;
+}
+}  // namespace
 
 struct MsgHeader {
     uint32_t type;
     uint32_t seq;
 };
 
-int main(int argc, char const* argv[]) {
+int main() {
+    std::signal(SIGINT, handle_signal);
+
     SocketUdpReceiver<> server;
     if (!server.init("", "127.0.0.1", 1234)) {
-        std::println("init failed: {}", server.getLastError());
+        std::cout << std::format("init failed: {}\n", server.getLastError());
         return 1;
     }
 
-    while (true) {
-        server.recvfrom([](const uint8_t* data, uint32_t size, auto addr) {
-            // 1. 直接打印收到的原始数据 dat
-            for (auto b : std::span(data, size)) {
-                std::print("{:02x} ", b);
+    while (g_running.load(std::memory_order_relaxed)) {
+        server.recvfrom([](const uint8_t* data, uint32_t size, const sockaddr_in& addr) {
+            if (size < sizeof(MsgHeader)) {
+                std::cout << std::format("drop short packet (size={}) from [{}:{}]\n",
+                                         size, addr_to_string(addr), ntohs(addr.sin_port));
+                return;
             }
-            std::println("from [{}:{}]", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
-            // 2. 解析时也直接使用 data
-            auto req_header = reinterpret_cast<const MsgHeader*>(data);
+            for (auto b : std::span(data, size)) {
+                std::cout << std::format("{:02x} ", b);
+            }
+            std::cout << std::format("from [{}:{}]\n", addr_to_string(addr), ntohs(addr.sin_port));
 
-            // 注意类型转换，data 是 uint8_t*，计算偏移时很安全
+            MsgHeader req_header{};
+            std::memcpy(&req_header, data, sizeof(MsgHeader));
+            uint32_t type = ntohl(req_header.type);
+            uint32_t seq = ntohl(req_header.seq);
+
             const char* body_ptr = reinterpret_cast<const char*>(data + sizeof(MsgHeader));
-            auto body_len = size - sizeof(MsgHeader);
+            size_t body_len = size - sizeof(MsgHeader);
+            std::string_view body(body_ptr, body_len);
 
-            auto body = std::string_view(body_ptr, body_len);
-            std::println("recv {}, type={}, seq={}", body, req_header->type, req_header->seq);
+            std::cout << std::format("recv {}, type={}, seq={}\n", body, type, seq);
         });
     }
+
+    return 0;
 }

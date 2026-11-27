@@ -1,8 +1,19 @@
+#include <atomic>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <format>
-#include <print>
+#include <iostream>
 #include <string>
+#include <string_view>
 
 #include "socket.h"
+
+namespace {
+std::atomic<bool> g_running{true};
+void handle_signal(int) { g_running.store(false, std::memory_order_relaxed); }
+}  // namespace
 
 struct ClientConf {
     static const uint32_t RecvBufSize = 4096;
@@ -24,66 +35,78 @@ class MyClient : public TcpClient {
     bool is_first = true;
 
    public:
-    MyClient(/* args */) {}
+    MyClient() = default;
     ~MyClient() = default;
 
-    void onTcpConnectFailed() { std::println("connect error:{}", this->getLastError()); }
-    void onTcpConnected(TcpClient::Conn& conn) {
-        std::println("connected! first={}", is_first);
+    void onTcpConnectFailed() {
+        std::cout << std::format("connect error: {}\n", this->getLastError());
+    }
+
+    void onTcpConnected([[maybe_unused]] TcpClient::Conn& conn) {
+        std::cout << std::format("connected! first={}\n", is_first);
         if (is_first) {
-            MsgHeader header;
             std::string msg{"hello"};
-            header.body_len = msg.size();
+            MsgHeader header{};
+            header.body_len = htonl(static_cast<uint32_t>(msg.size()));
             this->write(&header, sizeof(MsgHeader));
-            this->write(msg.data(), header.body_len);
+            this->write(msg.data(), static_cast<uint32_t>(msg.size()));
             this->write(&header, sizeof(MsgHeader));
-            this->write(msg.data(), header.body_len);
+            this->write(msg.data(), static_cast<uint32_t>(msg.size()));
         }
         is_first = false;
     }
-    void onTcpDisconnect(TcpClient::Conn& conn) { std::println("disconnected!"); }
-    void onSendTimeout(TcpClient::Conn& conn) { std::println("send timeout"); }
+
+    void onTcpDisconnect([[maybe_unused]] TcpClient::Conn& conn) {
+        std::cout << "disconnected!\n";
+    }
+
+    void onSendTimeout([[maybe_unused]] TcpClient::Conn& conn) {
+        std::cout << "send timeout\n";
+    }
+
     void onRecvTimeout(TcpClient::Conn& conn) {
-        std::println("recv timeout");
+        std::cout << "recv timeout\n";
         conn.close("onRecvTimeout");
     }
+
     uint32_t onTcpData(TcpClient::Conn& conn, const uint8_t* data, uint32_t size) {
         while (size >= sizeof(MsgHeader)) {
-            // 1. 解析 Header
-            const auto* header = reinterpret_cast<const MsgHeader*>(data);
-            uint32_t body_len = header->body_len;
-            uint32_t total_len = sizeof(MsgHeader) + body_len;
+            MsgHeader header{};
+            std::memcpy(&header, data, sizeof(MsgHeader));
+            uint32_t body_len = ntohl(header.body_len);
+            if (body_len > ClientConf::RecvBufSize - sizeof(MsgHeader)) {
+                conn.close("message too large");
+                return 0;
+            }
 
-            // 2. 检查缓冲区是否有完整的 Body
-            if (size < total_len) {
-                // 数据不足一个完整包，跳出循环，返回剩余字节数
-                // pollnet 会保留这些字节并在下次数据到达时拼接到 data 开头
+            if (size - sizeof(MsgHeader) < body_len) {
                 break;
             }
 
-            // 3. 处理 Body (使用 string_view 避免拷贝)
             std::string_view body{
-                reinterpret_cast<const char*>(data) + sizeof(MsgHeader),
+                reinterpret_cast<const char*>(data + sizeof(MsgHeader)),
                 body_len};
 
-            std::println("Recv Body [len: {}]: {}", body_len, body);
+            std::cout << std::format("Recv Body [len: {}]: {}\n", body_len, body);
 
-            // 4. 移动指针，准备处理下一个包
+            uint32_t total_len = static_cast<uint32_t>(sizeof(MsgHeader)) + body_len;
             data += total_len;
             size -= total_len;
         }
-        // 返回值告知 pollnet 缓冲区还剩多少字节没处理（即半包部分）
         return size;
     }
 };
 
-int main(int argc, char const* argv[]) {
+int main() {
+    std::signal(SIGINT, handle_signal);
+
     MyClient client;
     if (!client.init("", "127.0.0.1", 1234)) {
-        std::println("init error:{}", client.getLastError());
-        exit(1);
+        std::cout << std::format("init error: {}\n", client.getLastError());
+        return 1;
     }
-    while (true) {
+
+    while (g_running.load(std::memory_order_relaxed)) {
         client.poll(client);
     }
     return 0;

@@ -23,9 +23,6 @@ inline void close_socket(socket_t s) { closesocket(s); }
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
-#include <linux/if_packet.h>
-#include <net/ethernet.h>
-#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -46,6 +43,7 @@ inline void close_socket(socket_t s) { ::close(s); }
 #endif
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -235,7 +233,8 @@ class SocketTcpClient : public SocketTcpConnection<Conf> {
    public:
     using Conn = SocketTcpConnection<Conf>;
 
-    bool init(const char* interface_ip, const char* server_ip, uint16_t server_port, uint16_t local_port = 0) {
+    bool init([[maybe_unused]] const char* interface_ip, const char* server_ip, uint16_t server_port,
+              uint16_t local_port = 0) {
         ensure_network_init();
 
         server_addr_.sin_family = AF_INET;
@@ -345,7 +344,7 @@ class SocketTcpServer {
    public:
     using Conn = SocketTcpConnection<Conf>;
 
-    bool init(const char* interface_ip, const char* server_ip, uint16_t server_port) {
+    bool init([[maybe_unused]] const char* interface_ip, const char* server_ip, uint16_t server_port) {
         ensure_network_init();
 
         for (uint32_t i = 0; i < Conf::MaxConns; i++) conns_[i] = conns_data_ + i;
@@ -453,7 +452,7 @@ class SocketTcpServer {
 template <uint32_t RecvBufSize = 1500>
 class SocketUdpReceiver {
    public:
-    bool init(const char* interface_ip, const char* dest_ip, uint16_t dest_port,
+    bool init([[maybe_unused]] const char* interface_ip, const char* dest_ip, uint16_t dest_port,
               const char* subscribe_ip = "") {
         ensure_network_init();  // 触发全局一次性的 WSAStartup (Windows)
 
@@ -566,8 +565,8 @@ class SocketUdpReceiver {
 
 class SocketUdpSender {
    public:
-    bool init(const char* interface_ip, const char* local_ip, uint16_t local_port, const char* dest_ip,
-              uint16_t dest_port) {
+    bool init([[maybe_unused]] const char* interface_ip, const char* local_ip, uint16_t local_port,
+              const char* dest_ip, uint16_t dest_port) {
         ensure_network_init();
 
         if ((fd_ = socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET_FD) {

@@ -1,6 +1,6 @@
 # pollnet
 
-cross-platform pollnet based on [pollnet](github.com/MengRao/pollnet)
+cross-platform pollnet based on [pollnet](https://github.com/MengRao/pollnet)
 
 ## todo
 
