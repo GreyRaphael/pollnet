@@ -29,7 +29,12 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           git tag -l --format='%(contents)' "$TAG" > release_notes.txt
-          gh release create "$TAG" \
-            --title "pollnet $TAG" \
-            --notes-file release_notes.txt \
-            --generate-notes
+          if [ -s release_notes.txt ]; then
+            gh release create "$TAG" \
+              --title "pollnet $TAG" \
+              --notes-file release_notes.txt
+          else
+            gh release create "$TAG" \
+              --title "pollnet $TAG" \
+              --generate-notes
+          fi
