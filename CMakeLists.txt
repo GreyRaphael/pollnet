@@ -38,7 +38,7 @@ if(POLLNET_BUILD_TESTS)
 endif()
 
 if(POLLNET_BUILD_EXAMPLES)
-  foreach(name tcp_server tcp_client udp_server udp_client)
+  foreach(name tcp_server tcp_client eventloop_tcp_server udp_server udp_client)
     pollnet_add_executable(${name} examples/${name}.cpp)
   endforeach()
 endif()
