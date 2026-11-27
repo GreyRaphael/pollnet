@@ -77,13 +77,13 @@ ctest --test-dir build -C Debug --output-on-failure
 ```bash
 cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release
 cmake --build build-rel --target pollnet_bench -j
-./build-rel/pollnet_bench --warmup 2000 --iters 50000 --throughput-iters 200000 --payload 64
+./build-rel/pollnet_bench --warmup 5000 --iters 50000 --throughput-iters 200000 --payload 64 --server-cpu 2 --client-cpu 4
 ```
 
-一键提取 `v1.1.0` 头文件并使用相同编译参数对比 `v1.1.0` 与 `v2.0.0`：
+一键提取 `v1.1.0` 头文件并使用相同编译参数对比 `v1.1.0` 与 `v2.0.0`（支持 `--server-cpu` / `--client-cpu` 绑核）：
 
 ```bash
-./benchmarks/compare_v1_v2.sh --warmup 2000 --iters 30000 --throughput-iters 200000 --payload 64
+./benchmarks/compare_v1_v2.sh --warmup 5000 --iters 50000 --throughput-iters 200000 --payload 64 --server-cpu 2 --client-cpu 4
 ```
 
 ## todo

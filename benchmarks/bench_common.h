@@ -1,5 +1,18 @@
 #pragma once
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -10,6 +23,7 @@
 #include <numeric>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace pollnet_bench {
@@ -19,6 +33,8 @@ struct BenchConfig {
     size_t iters = 50000;
     size_t throughput_iters = 200000;
     size_t payload = 64;
+    int server_cpu = -1;
+    int client_cpu = -1;
     bool csv = false;
 };
 
@@ -27,9 +43,45 @@ struct BenchConfig {
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+inline bool pin_current_thread(int cpu_id, std::string_view role = "") noexcept {
+    if (cpu_id < 0) return true;
+#ifdef _WIN32
+    if (cpu_id >= static_cast<int>(sizeof(DWORD_PTR) * 8)) {
+        std::cerr << std::format("[warn] invalid cpu_id {} for {}\n", cpu_id, role);
+        return false;
+    }
+    DWORD_PTR mask = (DWORD_PTR{1} << cpu_id);
+    if (::SetThreadAffinityMask(::GetCurrentThread(), mask) == 0) {
+        std::cerr << std::format("[warn] SetThreadAffinityMask({}) failed for {} (err={})\n",
+                                 cpu_id, role, ::GetLastError());
+        return false;
+    }
+    return true;
+#elif defined(__linux__)
+    if (cpu_id >= CPU_SETSIZE) {
+        std::cerr << std::format("[warn] cpu_id {} >= CPU_SETSIZE for {}\n", cpu_id, role);
+        return false;
+    }
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu_id, &cpuset);
+    int rc = ::pthread_setaffinity_np(::pthread_self(), sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        std::cerr << std::format("[warn] pthread_setaffinity_np({}) failed for {} ({})\n",
+                                 cpu_id, role, std::generic_category().message(rc));
+        return false;
+    }
+    return true;
+#else
+    (void)role;
+    return false;
+#endif
+}
+
 inline void print_usage(const char* prog) {
     std::cout << std::format(
-        "Usage: {} [--warmup N] [--iters N] [--throughput-iters N] [--payload BYTES] [--csv]\n",
+        "Usage: {} [--warmup N] [--iters N] [--throughput-iters N] [--payload BYTES] "
+        "[--server-cpu ID] [--client-cpu ID] [--csv]\n",
         prog);
 }
 
@@ -39,6 +91,15 @@ inline void print_usage(const char* prog) {
     unsigned long long val = std::strtoull(str, &end, 10);
     if (end == str || *end != '\0') return false;
     out = static_cast<size_t>(val);
+    return true;
+}
+
+[[nodiscard]] inline bool parse_int_arg(const char* str, int& out) {
+    if (!str || str[0] == '\0') return false;
+    char* end = nullptr;
+    long val = std::strtol(str, &end, 10);
+    if (end == str || *end != '\0') return false;
+    out = static_cast<int>(val);
     return true;
 }
 
@@ -60,6 +121,10 @@ inline void print_usage(const char* prog) {
             }
         } else if (arg == "--payload" && i + 1 < argc) {
             if (!parse_size_arg(argv[++i], cfg.payload)) return false;
+        } else if (arg == "--server-cpu" && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], cfg.server_cpu)) return false;
+        } else if (arg == "--client-cpu" && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], cfg.client_cpu)) return false;
         } else {
             std::cerr << std::format("Unknown or incomplete option: {}\n", arg);
             print_usage(argv[0]);

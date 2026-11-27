@@ -24,6 +24,7 @@ bool run_tcp_ping_pong(const pollnet_bench::BenchConfig& cfg, std::string_view l
     std::atomic<bool> stop{false};
 
     std::thread srv_thread([&]() {
+        pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
         Server server;
         if (!server.listen({.host = "127.0.0.1", .port = 0})) {
             std::cerr << std::format("[v2] server listen failed: {}\n", server.lastError());
@@ -139,6 +140,7 @@ bool run_tcp_throughput(const pollnet_bench::BenchConfig& cfg) {
     std::atomic<bool> stop{false};
 
     std::thread srv_thread([&]() {
+        pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
         Server server;
         if (!server.listen({.host = "127.0.0.1", .port = 0})) {
             std::cerr << std::format("[v2] tcp_tp server listen failed: {}\n", server.lastError());
@@ -235,6 +237,7 @@ bool run_udp_ping_pong(const pollnet_bench::BenchConfig& cfg) {
     std::atomic<bool> stop{false};
 
     std::thread srv_thread([&]() {
+        pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
         pollnet::UdpReceiver<2048> server;
         if (!server.open({.bind_ip = "127.0.0.1", .bind_port = 0})) {
             std::cerr << std::format("[v2] udp_pp server open failed: {}\n", server.lastError());
@@ -315,6 +318,7 @@ bool run_udp_throughput(const pollnet_bench::BenchConfig& cfg) {
     std::atomic<int64_t> last_pkt_ns{0};
 
     std::thread srv_thread([&]() {
+        pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
         pollnet::UdpReceiver<2048> server;
         if (!server.open({.bind_ip = "127.0.0.1", .bind_port = 0})) {
             std::cerr << std::format("[v2] udp_tp server open failed: {}\n", server.lastError());
@@ -407,10 +411,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    pollnet_bench::pin_current_thread(cfg.client_cpu, "client");
+
     if (!cfg.csv) {
         std::cout << std::format(
-            "=== pollnet v2.0.0 benchmark (warmup={}, iters={}, tp_iters={}, payload={}B) ===\n",
-            cfg.warmup, cfg.iters, cfg.throughput_iters, cfg.payload);
+            "=== pollnet v2.0.0 benchmark (warmup={}, iters={}, tp_iters={}, payload={}B, "
+            "server_cpu={}, client_cpu={}) ===\n",
+            cfg.warmup, cfg.iters, cfg.throughput_iters, cfg.payload, cfg.server_cpu,
+            cfg.client_cpu);
     }
 
     if (!run_tcp_ping_pong<false>(cfg, "tcp_ping_pong")) return 1;
