@@ -4,9 +4,10 @@
 #include <format>
 #include <iostream>
 #include <ranges>
+#include <span>
 #include <string>
 
-#include "socket.h"
+#include "pollnet/socket.h"
 
 struct MsgHeader {
     uint32_t type;
@@ -14,7 +15,7 @@ struct MsgHeader {
 };
 
 int main() {
-    SocketUdpSender client;
+    pollnet::SocketUdpSender client;
     if (!client.init("", "127.0.0.1", 4321, "127.0.0.1", 1234)) {
         std::cout << std::format("init error: {}\n", client.getLastError());
         return 1;
@@ -42,7 +43,7 @@ int main() {
         }
         std::cout << '\n';
 
-        if (!client.write(send_buf.data(), static_cast<uint32_t>(total_len))) {
+        if (!client.write(std::span<const uint8_t>{send_buf.data(), total_len})) {
             std::cout << std::format("send failed: {}\n", client.getLastError());
         }
     }

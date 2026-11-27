@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 
-#include "socket.h"
+#include "pollnet/socket.h"
 
 namespace {
 std::atomic<bool> g_running{true};
@@ -36,7 +36,7 @@ struct ServerConf {
     };
 };
 
-using TcpServer = SocketTcpServer<ServerConf>;
+using TcpServer = pollnet::SocketTcpServer<ServerConf>;
 
 struct MsgHeader {
     uint32_t body_len;
@@ -60,7 +60,9 @@ class MyServer : public TcpServer {
     ~MyServer() = default;
 
     void onTcpConnected(TcpServer::Conn& conn) {
-        conn.getPeername(conn.addr);
+        if (!conn.getPeername(conn.addr)) {
+            conn.addr = {};
+        }
         std::cout << std::format("new connection from {}:{}, total={}\n",
                                  addr_to_string(conn.addr), ntohs(conn.addr.sin_port), getConnCnt());
     }

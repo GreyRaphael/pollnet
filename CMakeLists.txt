@@ -5,18 +5,37 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(POLLNET_BUILD_EXAMPLES "Build pollnet examples" ON)
+option(POLLNET_BUILD_TESTS "Build pollnet tests" ON)
+
 add_library(pollnet INTERFACE)
-target_include_directories(pollnet INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(pollnet INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
 target_compile_features(pollnet INTERFACE cxx_std_20)
 if(WIN32)
     target_link_libraries(pollnet INTERFACE ws2_32)
 endif()
 
-foreach(target tcp_server tcp_client udp_server udp_client)
-    add_executable(${target} ${target}.cpp)
-    target_link_libraries(${target} PRIVATE pollnet)
-    target_compile_options(${target} PRIVATE
+if(POLLNET_BUILD_EXAMPLES)
+    foreach(target tcp_server tcp_client udp_server udp_client)
+        add_executable(${target} examples/${target}.cpp)
+        target_link_libraries(${target} PRIVATE pollnet)
+        target_compile_options(${target} PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+        )
+    endforeach()
+endif()
+
+include(CTest)
+if(POLLNET_BUILD_TESTS AND BUILD_TESTING)
+    add_executable(test_pollnet tests/test_pollnet.cpp)
+    target_link_libraries(test_pollnet PRIVATE pollnet)
+    target_compile_options(test_pollnet PRIVATE
         $<$<CXX_COMPILER_ID:MSVC>:/W4 /utf-8>
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
     )
-endforeach()
+    add_test(NAME pollnet_tests COMMAND test_pollnet)
+endif()

@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-#include "socket.h"
+#include "pollnet/socket.h"
 
 namespace {
 std::atomic<bool> g_running{true};
@@ -24,7 +24,7 @@ struct ClientConf {
     struct UserData {};
 };
 
-using TcpClient = SocketTcpClient<ClientConf>;
+using TcpClient = pollnet::SocketTcpClient<ClientConf>;
 
 struct MsgHeader {
     uint32_t body_len;
@@ -48,10 +48,16 @@ class MyClient : public TcpClient {
             std::string msg{"hello"};
             MsgHeader header{};
             header.body_len = htonl(static_cast<uint32_t>(msg.size()));
-            this->write(&header, sizeof(MsgHeader));
-            this->write(msg.data(), static_cast<uint32_t>(msg.size()));
-            this->write(&header, sizeof(MsgHeader));
-            this->write(msg.data(), static_cast<uint32_t>(msg.size()));
+
+            std::string packet;
+            packet.resize(sizeof(MsgHeader) + msg.size());
+            std::memcpy(packet.data(), &header, sizeof(MsgHeader));
+            std::memcpy(packet.data() + sizeof(MsgHeader), msg.data(), msg.size());
+
+            if (!this->write(packet.data(), static_cast<uint32_t>(packet.size())) ||
+                !this->write(packet.data(), static_cast<uint32_t>(packet.size()))) {
+                std::cout << std::format("write error: {}\n", this->getLastError());
+            }
         }
         is_first = false;
     }

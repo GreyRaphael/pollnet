@@ -10,16 +10,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
-
-using socket_t = SOCKET;
-constexpr socket_t INVALID_SOCKET_FD = INVALID_SOCKET;
-using sockopt_val_t = const char*;
-
-inline int get_last_error() { return WSAGetLastError(); }
-inline bool is_would_block(int err) { return err == WSAEWOULDBLOCK; }
-inline bool is_connect_in_progress(int err) { return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS; }
-inline bool is_eintr(int err) { return err == WSAEINTR; }
-inline void close_socket(socket_t s) { ::closesocket(s); }
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -31,33 +21,62 @@ inline void close_socket(socket_t s) { ::closesocket(s); }
 #include <unistd.h>
 
 #include <cerrno>
-
-using socket_t = int;
-constexpr socket_t INVALID_SOCKET_FD = -1;
-using sockopt_val_t = const void*;
-
-inline int get_last_error() { return errno; }
-inline bool is_would_block(int err) { return err == EAGAIN || err == EWOULDBLOCK; }
-inline bool is_connect_in_progress(int err) { return err == EINPROGRESS || err == EINTR; }
-inline bool is_eintr(int err) { return err == EINTR; }
-inline void close_socket(socket_t s) { ::close(s); }
 #endif
 
 #include <algorithm>
+#include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
 #include <limits>
+#include <span>
 #include <utility>
 
+namespace pollnet {
+
+namespace detail {
+
+#ifdef _WIN32
+using socket_t = SOCKET;
+inline constexpr socket_t INVALID_SOCKET_FD = INVALID_SOCKET;
+using sockopt_val_t = const char*;
+
+[[nodiscard]] inline int get_last_error() noexcept { return ::WSAGetLastError(); }
+[[nodiscard]] inline bool is_would_block(int err) noexcept { return err == WSAEWOULDBLOCK; }
+[[nodiscard]] inline bool is_connect_in_progress(int err) noexcept {
+    return err == WSAEWOULDBLOCK || err == WSAEINPROGRESS;
+}
+[[nodiscard]] inline bool is_eintr(int err) noexcept { return err == WSAEINTR; }
+inline void close_socket(socket_t s) noexcept { ::closesocket(s); }
+#else
+using socket_t = int;
+inline constexpr socket_t INVALID_SOCKET_FD = -1;
+using sockopt_val_t = const void*;
+
+[[nodiscard]] inline int get_last_error() noexcept { return errno; }
+[[nodiscard]] inline bool is_would_block(int err) noexcept {
+    return err == EAGAIN || err == EWOULDBLOCK;
+}
+[[nodiscard]] inline bool is_connect_in_progress(int err) noexcept {
+    return err == EINPROGRESS || err == EINTR;
+}
+[[nodiscard]] inline bool is_eintr(int err) noexcept { return err == EINTR; }
+inline void close_socket(socket_t s) noexcept { ::close(s); }
+#endif
+
+[[nodiscard]] inline int64_t now_ms() noexcept {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 // C++20 线程安全的全局 WSA 初始化与自动清理助手
-inline bool ensure_network_init() {
+[[nodiscard]] inline bool ensure_network_init() noexcept {
 #ifdef _WIN32
     struct WsaGuard {
         bool ok = false;
-        WsaGuard() {
+        WsaGuard() noexcept {
             WSADATA wsaData{};
             ok = (::WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
         }
@@ -75,18 +94,18 @@ inline bool ensure_network_init() {
 }
 
 #ifndef _WIN32
-inline const char* strerror_result(int rc, char* buf) {
+[[nodiscard]] inline const char* strerror_result(int rc, char* buf) noexcept {
     return (rc == 0) ? buf : "unknown error";
 }
 
-inline const char* strerror_result(const char* res, char*) {
+[[nodiscard]] inline const char* strerror_result(const char* res, char*) noexcept {
     return res ? res : "unknown error";
 }
 #endif
 
 // 线程安全的跨平台错误格式化
 inline void format_socket_error(char* buf, size_t buf_size, const char* msg, bool check_errno,
-                                int err_override = 0) {
+                                int err_override = 0) noexcept {
     if (buf_size == 0) return;
     const char* safe_msg = msg ? msg : "";
     if (!check_errno) {
@@ -117,7 +136,7 @@ inline void format_socket_error(char* buf, size_t buf_size, const char* msg, boo
 }
 
 // 统一设置非阻塞模式
-inline bool set_nonblocking(socket_t fd) {
+[[nodiscard]] inline bool set_nonblocking(socket_t fd) noexcept {
 #ifdef _WIN32
     u_long mode = 1;
     return ::ioctlsocket(fd, FIONBIO, &mode) == 0;
@@ -129,7 +148,7 @@ inline bool set_nonblocking(socket_t fd) {
 }
 
 #ifdef _WIN32
-inline void disable_udp_connreset(socket_t fd) {
+inline void disable_udp_connreset(socket_t fd) noexcept {
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
@@ -141,7 +160,7 @@ inline void disable_udp_connreset(socket_t fd) {
 #endif
 
 // 非阻塞 connect 状态探测：返回 1 已连接，0 进行中，-1 失败（out_err 写入具体错误码）
-inline int check_connect_status(socket_t fd, int& out_err) {
+[[nodiscard]] inline int check_connect_status(socket_t fd, int& out_err) noexcept {
     out_err = 0;
 #ifdef _WIN32
     fd_set wfds;
@@ -206,16 +225,70 @@ inline int check_connect_status(socket_t fd, int& out_err) {
 #endif
 }
 
+}  // namespace detail
+
+// ==========================================
+// C++20 概念约束 (Concepts)
+// ==========================================
+
+template <typename Conf>
+concept TcpConnConfig = requires {
+    typename Conf::UserData;
+    requires std::convertible_to<decltype(Conf::RecvBufSize), uint32_t>;
+    requires std::convertible_to<decltype(Conf::SendTimeoutSec), uint32_t>;
+    requires std::convertible_to<decltype(Conf::RecvTimeoutSec), uint32_t>;
+    requires(Conf::RecvBufSize > 0);
+    requires(Conf::RecvBufSize <= static_cast<uint32_t>(std::numeric_limits<int>::max()));
+};
+
+template <typename Conf>
+concept TcpClientConfig = TcpConnConfig<Conf> && requires {
+    requires std::convertible_to<decltype(Conf::ConnRetrySec), uint32_t>;
+    requires std::convertible_to<decltype(Conf::ConnTimeoutSec), uint32_t>;
+};
+
+template <typename Conf>
+concept TcpServerConfig = TcpConnConfig<Conf> && requires {
+    requires std::convertible_to<decltype(Conf::MaxConns), uint32_t>;
+    requires(Conf::MaxConns > 0);
+};
+
+template <typename H, typename Conn>
+concept TcpClientHandler =
+    requires(H& h, Conn& conn, const uint8_t* data, uint32_t size) {
+        h.onTcpConnectFailed();
+        h.onTcpConnected(conn);
+        h.onTcpDisconnect(conn);
+        h.onSendTimeout(conn);
+        h.onRecvTimeout(conn);
+        { h.onTcpData(conn, data, size) } -> std::convertible_to<uint32_t>;
+    };
+
+template <typename H, typename Conn>
+concept TcpServerHandler =
+    requires(H& h, Conn& conn, const uint8_t* data, uint32_t size) {
+        h.onTcpConnected(conn);
+        h.onTcpDisconnect(conn);
+        h.onSendTimeout(conn);
+        h.onRecvTimeout(conn);
+        { h.onTcpData(conn, data, size) } -> std::convertible_to<uint32_t>;
+    };
+
+template <typename H>
+concept UdpReadHandler = std::invocable<H, const uint8_t*, uint32_t>;
+
+template <typename H>
+concept UdpRecvFromHandler = std::invocable<H, const uint8_t*, uint32_t, const sockaddr_in&>;
+
 // ==========================================
 // 业务逻辑实现 (Business Logic)
 // ==========================================
 
-template <typename Conf>
-class SocketTcpConnection : public Conf::UserData {
-    static_assert(Conf::RecvBufSize > 0 &&
-                      Conf::RecvBufSize <= static_cast<uint32_t>(std::numeric_limits<int>::max()),
-                  "Conf::RecvBufSize must be in (0, INT_MAX]");
+template <TcpServerConfig Conf>
+class SocketTcpServer;
 
+template <TcpConnConfig Conf>
+class SocketTcpConnection : public Conf::UserData {
    public:
     SocketTcpConnection() = default;
     SocketTcpConnection(const SocketTcpConnection&) = delete;
@@ -225,26 +298,26 @@ class SocketTcpConnection : public Conf::UserData {
 
     ~SocketTcpConnection() { close("destruct"); }
 
-    const char* getLastError() const { return last_error_; }
+    [[nodiscard]] const char* getLastError() const noexcept { return last_error_; }
 
-    bool isConnected() const { return fd_ != INVALID_SOCKET_FD; }
+    [[nodiscard]] bool isConnected() const noexcept { return fd_ != detail::INVALID_SOCKET_FD; }
 
-    bool getPeername(struct sockaddr_in& addr) const {
-        if (fd_ == INVALID_SOCKET_FD) return false;
+    [[nodiscard]] bool getPeername(struct sockaddr_in& addr) const noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
         socklen_t addr_len = sizeof(addr);
         return ::getpeername(fd_, reinterpret_cast<struct sockaddr*>(&addr), &addr_len) == 0;
     }
 
-    void close(const char* reason, bool check_errno = false, int err_override = 0) {
-        if (fd_ != INVALID_SOCKET_FD) {
+    void close(const char* reason, bool check_errno = false, int err_override = 0) noexcept {
+        if (fd_ != detail::INVALID_SOCKET_FD) {
             saveError(reason, check_errno, err_override);
-            close_socket(fd_);
-            fd_ = INVALID_SOCKET_FD;
+            detail::close_socket(fd_);
+            fd_ = detail::INVALID_SOCKET_FD;
         }
     }
 
-    int writeSome(const void* data, uint32_t size, bool more = false) {
-        if (fd_ == INVALID_SOCKET_FD) return -1;
+    [[nodiscard]] int writeSome(const void* data, uint32_t size, bool more = false) noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return -1;
         if (size == 0) return 0;
         if (size > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
             close("send size overflow", false);
@@ -261,23 +334,37 @@ class SocketTcpConnection : public Conf::UserData {
         int ret = 0;
         do {
             ret = ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), flags);
-        } while (ret < 0 && is_eintr(get_last_error()));
+        } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (ret < 0) {
-            int err = get_last_error();
-            if (is_would_block(err)) {
+            int err = detail::get_last_error();
+            if (detail::is_would_block(err)) {
                 return 0;
             }
             close("send error", true, err);
             return -1;
         }
-        if (ret > 0 && Conf::SendTimeoutSec) {
-            send_ts_ = std::time(nullptr);
+        if constexpr (Conf::SendTimeoutSec > 0) {
+            if (ret > 0) {
+                send_ts_ = detail::now_ms();
+            }
         }
         return ret;
     }
 
-    bool write(const void* data_, uint32_t size, bool more = false) {
+    [[nodiscard]] int writeSome(std::span<const std::byte> data, bool more = false) noexcept {
+        if (data.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            close("send size overflow", false);
+            return -1;
+        }
+        return writeSome(data.data(), static_cast<uint32_t>(data.size()), more);
+    }
+
+    [[nodiscard]] int writeSome(std::span<const uint8_t> data, bool more = false) noexcept {
+        return writeSome(std::as_bytes(data), more);
+    }
+
+    [[nodiscard]] bool write(const void* data_, uint32_t size, bool more = false) noexcept {
         if (size == 0) return isConnected();
         const uint8_t* data = static_cast<const uint8_t*>(data_);
         do {
@@ -289,7 +376,19 @@ class SocketTcpConnection : public Conf::UserData {
         return true;
     }
 
-    bool writeNonblock(const void* data, uint32_t size, bool more = false) {
+    [[nodiscard]] bool write(std::span<const std::byte> data, bool more = false) noexcept {
+        if (data.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            close("send size overflow", false);
+            return false;
+        }
+        return write(data.data(), static_cast<uint32_t>(data.size()), more);
+    }
+
+    [[nodiscard]] bool write(std::span<const uint8_t> data, bool more = false) noexcept {
+        return write(std::as_bytes(data), more);
+    }
+
+    [[nodiscard]] bool writeNonblock(const void* data, uint32_t size, bool more = false) noexcept {
         if (size == 0) return isConnected();
         int sent = writeSome(data, size, more);
         if (sent < 0) return false;
@@ -300,30 +399,50 @@ class SocketTcpConnection : public Conf::UserData {
         return true;
     }
 
+    [[nodiscard]] bool writeNonblock(std::span<const std::byte> data, bool more = false) noexcept {
+        if (data.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            close("send size overflow", false);
+            return false;
+        }
+        return writeNonblock(data.data(), static_cast<uint32_t>(data.size()), more);
+    }
+
+    [[nodiscard]] bool writeNonblock(std::span<const uint8_t> data, bool more = false) noexcept {
+        return writeNonblock(std::as_bytes(data), more);
+    }
+
    protected:
-    template <typename ServerConf>
+    template <TcpServerConfig ServerConf>
     friend class SocketTcpServer;
 
     template <typename Handler>
     void pollConn(int64_t now, Handler& handler) {
-        if (Conf::SendTimeoutSec && now >= send_ts_ + Conf::SendTimeoutSec) {
-            handler.onSendTimeout(*this);
-            send_ts_ = now;
+        if constexpr (Conf::SendTimeoutSec > 0) {
+            constexpr int64_t kSendTimeoutMs = static_cast<int64_t>(Conf::SendTimeoutSec) * 1000LL;
+            if (now >= send_ts_ + kSendTimeoutMs) {
+                handler.onSendTimeout(*this);
+                send_ts_ = now;
+            }
         }
         bool got_data = read(
             [&](const uint8_t* data, uint32_t size) { return handler.onTcpData(*this, data, size); });
-        if (Conf::RecvTimeoutSec && isConnected()) {
-            if (!got_data && now >= expire_ts_) {
-                handler.onRecvTimeout(*this);
-                got_data = true;
+        if constexpr (Conf::RecvTimeoutSec > 0) {
+            constexpr int64_t kRecvTimeoutMs = static_cast<int64_t>(Conf::RecvTimeoutSec) * 1000LL;
+            if (isConnected()) {
+                if (!got_data && now >= expire_ts_) {
+                    handler.onRecvTimeout(*this);
+                    got_data = true;
+                }
+                if (got_data) expire_ts_ = now + kRecvTimeoutMs;
             }
-            if (got_data) expire_ts_ = now + Conf::RecvTimeoutSec;
         }
     }
 
     template <typename Handler>
+        requires std::invocable<Handler&, const uint8_t*, uint32_t> &&
+                 std::convertible_to<std::invoke_result_t<Handler&, const uint8_t*, uint32_t>, uint32_t>
     bool read(Handler handler) {
-        if (fd_ == INVALID_SOCKET_FD) return false;
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
         if (tail_ >= Conf::RecvBufSize) {
             close("recv buf full", false);
             return false;
@@ -333,12 +452,12 @@ class SocketTcpConnection : public Conf::UserData {
         do {
             ret = ::recv(fd_, reinterpret_cast<char*>(recvbuf_ + tail_),
                          static_cast<int>(Conf::RecvBufSize - tail_), 0);
-        } while (ret < 0 && is_eintr(get_last_error()));
+        } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (ret <= 0) {
             if (ret < 0) {
-                int err = get_last_error();
-                if (is_would_block(err)) return false;
+                int err = detail::get_last_error();
+                if (detail::is_would_block(err)) return false;
                 close("read error", true, err);
             } else {
                 close("remote close");
@@ -348,7 +467,7 @@ class SocketTcpConnection : public Conf::UserData {
         tail_ += static_cast<uint32_t>(ret);
 
         uint32_t avail = tail_ - head_;
-        uint32_t remaining = handler(recvbuf_ + head_, avail);
+        uint32_t remaining = static_cast<uint32_t>(handler(recvbuf_ + head_, avail));
         if (!isConnected()) {
             head_ = tail_ = 0;
             return false;
@@ -373,19 +492,20 @@ class SocketTcpConnection : public Conf::UserData {
         return true;
     }
 
-    bool open(int64_t now, socket_t fd) {
+    bool open(int64_t now, detail::socket_t fd) noexcept {
         fd_ = fd;
         head_ = tail_ = 0;
         send_ts_ = now;
-        expire_ts_ = now + Conf::RecvTimeoutSec;
+        expire_ts_ = now + static_cast<int64_t>(Conf::RecvTimeoutSec) * 1000LL;
 
-        if (!set_nonblocking(fd_)) {
+        if (!detail::set_nonblocking(fd_)) {
             close("set nonblock error", true);
             return false;
         }
 
         int yes = 1;
-        if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<sockopt_val_t>(&yes), sizeof(yes)) < 0) {
+        if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY,
+                         reinterpret_cast<detail::sockopt_val_t>(&yes), sizeof(yes)) < 0) {
             close("setsockopt TCP_NODELAY error", true);
             return false;
         }
@@ -393,11 +513,11 @@ class SocketTcpConnection : public Conf::UserData {
         return true;
     }
 
-    void saveError(const char* msg, bool check_errno, int err_override = 0) {
-        format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
+    void saveError(const char* msg, bool check_errno, int err_override = 0) noexcept {
+        detail::format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
     }
 
-    socket_t fd_ = INVALID_SOCKET_FD;
+    detail::socket_t fd_ = detail::INVALID_SOCKET_FD;
     int64_t send_ts_ = 0;
     int64_t expire_ts_ = 0;
     uint32_t head_ = 0;
@@ -406,7 +526,7 @@ class SocketTcpConnection : public Conf::UserData {
     char last_error_[128] = "";
 };
 
-template <typename Conf>
+template <TcpClientConfig Conf>
 class SocketTcpClient : public SocketTcpConnection<Conf> {
    public:
     using Conn = SocketTcpConnection<Conf>;
@@ -419,17 +539,17 @@ class SocketTcpClient : public SocketTcpConnection<Conf> {
 
     ~SocketTcpClient() { closePendingConnect(); }
 
-    bool init([[maybe_unused]] const char* interface_ip, const char* server_ip, uint16_t server_port,
-              uint16_t local_port = 0) {
+    [[nodiscard]] bool init([[maybe_unused]] const char* interface_ip, const char* server_ip,
+                            uint16_t server_port, uint16_t local_port = 0) noexcept {
         this->close("reinit");
         closePendingConnect();
         report_disconnect_ = false;
-        next_conn_ts_ = 0;
+        next_conn_ts_ = std::numeric_limits<int64_t>::min();
         conn_expire_ts_ = 0;
         server_addr_ = {};
         local_port_be_ = 0;
 
-        if (!ensure_network_init()) {
+        if (!detail::ensure_network_init()) {
             Conn::saveError("WSAStartup failed", false);
             return false;
         }
@@ -448,11 +568,11 @@ class SocketTcpClient : public SocketTcpConnection<Conf> {
         return true;
     }
 
-    void allowReconnect() { next_conn_ts_ = 0; }
+    void allowReconnect() noexcept { next_conn_ts_ = std::numeric_limits<int64_t>::min(); }
 
-    template <typename Handler>
+    template <TcpClientHandler<Conn> Handler>
     void poll(Handler& handler) {
-        int64_t now = std::time(nullptr);
+        int64_t now = detail::now_ms();
         if (!this->isConnected()) {
             if (report_disconnect_) {
                 handler.onTcpDisconnect(*this);
@@ -470,23 +590,24 @@ class SocketTcpClient : public SocketTcpConnection<Conf> {
     }
 
    private:
-    void closePendingConnect() {
-        if (conn_fd_ != INVALID_SOCKET_FD) {
-            close_socket(conn_fd_);
-            conn_fd_ = INVALID_SOCKET_FD;
+    void closePendingConnect() noexcept {
+        if (conn_fd_ != detail::INVALID_SOCKET_FD) {
+            detail::close_socket(conn_fd_);
+            conn_fd_ = detail::INVALID_SOCKET_FD;
         }
     }
 
-    int connect(int64_t now) {
-        if (conn_fd_ == INVALID_SOCKET_FD) {
+    int connect(int64_t now) noexcept {
+        if (conn_fd_ == detail::INVALID_SOCKET_FD) {
             if (now < next_conn_ts_) return 0;
-            if (Conf::ConnRetrySec)
-                next_conn_ts_ = now + Conf::ConnRetrySec;
-            else
+            if constexpr (Conf::ConnRetrySec > 0) {
+                next_conn_ts_ = now + static_cast<int64_t>(Conf::ConnRetrySec) * 1000LL;
+            } else {
                 next_conn_ts_ = std::numeric_limits<int64_t>::max();
+            }
 
-            socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
-            if (fd == INVALID_SOCKET_FD) {
+            detail::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (fd == detail::INVALID_SOCKET_FD) {
                 Conn::saveError("socket error", true);
                 return -1;
             }
@@ -497,14 +618,14 @@ class SocketTcpClient : public SocketTcpConnection<Conf> {
                 local_addr.sin_port = local_port_be_;
                 if (::bind(fd, reinterpret_cast<struct sockaddr*>(&local_addr), sizeof(local_addr)) < 0) {
                     Conn::saveError("bind error", true);
-                    close_socket(fd);
+                    detail::close_socket(fd);
                     return -1;
                 }
             }
 
-            if (!set_nonblocking(fd)) {
+            if (!detail::set_nonblocking(fd)) {
                 Conn::saveError("set nonblock error", true);
-                close_socket(fd);
+                detail::close_socket(fd);
                 return -1;
             }
 
@@ -513,26 +634,27 @@ class SocketTcpClient : public SocketTcpConnection<Conf> {
                 return Conn::open(now, fd) ? 1 : -1;
             }
 
-            int err = get_last_error();
-            if (is_connect_in_progress(err)) {
+            int err = detail::get_last_error();
+            if (detail::is_connect_in_progress(err)) {
                 conn_fd_ = fd;
-                if (Conf::ConnTimeoutSec)
-                    conn_expire_ts_ = now + Conf::ConnTimeoutSec;
-                else
+                if constexpr (Conf::ConnTimeoutSec > 0) {
+                    conn_expire_ts_ = now + static_cast<int64_t>(Conf::ConnTimeoutSec) * 1000LL;
+                } else {
                     conn_expire_ts_ = std::numeric_limits<int64_t>::max();
+                }
                 return 0;
             }
 
             Conn::saveError("connect error", true, err);
-            close_socket(fd);
+            detail::close_socket(fd);
             return -1;
         }
 
         int conn_err = 0;
-        int status = check_connect_status(conn_fd_, conn_err);
+        int status = detail::check_connect_status(conn_fd_, conn_err);
         if (status > 0) {
-            socket_t fd = conn_fd_;
-            conn_fd_ = INVALID_SOCKET_FD;
+            detail::socket_t fd = conn_fd_;
+            conn_fd_ = detail::INVALID_SOCKET_FD;
             return Conn::open(now, fd) ? 1 : -1;
         }
         if (status < 0) {
@@ -549,21 +671,19 @@ class SocketTcpClient : public SocketTcpConnection<Conf> {
     }
 
     bool report_disconnect_ = false;
-    socket_t conn_fd_ = INVALID_SOCKET_FD;
-    int64_t next_conn_ts_ = 0;
+    detail::socket_t conn_fd_ = detail::INVALID_SOCKET_FD;
+    int64_t next_conn_ts_ = std::numeric_limits<int64_t>::min();
     int64_t conn_expire_ts_ = 0;
     struct sockaddr_in server_addr_{};
     uint16_t local_port_be_ = 0;
 };
 
-template <typename Conf>
+template <TcpServerConfig Conf>
 class SocketTcpServer {
-    static_assert(Conf::MaxConns > 0, "Conf::MaxConns must be > 0");
-
    public:
     using Conn = SocketTcpConnection<Conf>;
 
-    SocketTcpServer() {
+    SocketTcpServer() noexcept {
         for (uint32_t i = 0; i < Conf::MaxConns; i++) conns_[i] = conns_data_ + i;
     }
     SocketTcpServer(const SocketTcpServer&) = delete;
@@ -573,14 +693,15 @@ class SocketTcpServer {
 
     ~SocketTcpServer() { close("destruct"); }
 
-    bool init([[maybe_unused]] const char* interface_ip, const char* server_ip, uint16_t server_port) {
+    [[nodiscard]] bool init([[maybe_unused]] const char* interface_ip, const char* server_ip,
+                            uint16_t server_port) noexcept {
         for (uint32_t i = 0; i < conns_cnt_; i++) {
             conns_[i]->close("reinit");
         }
         conns_cnt_ = 0;
         close("reinit");
 
-        if (!ensure_network_init()) {
+        if (!detail::ensure_network_init()) {
             saveError("WSAStartup failed", false);
             return false;
         }
@@ -598,19 +719,19 @@ class SocketTcpServer {
         local_addr.sin_port = htons(server_port);
 
         listenfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listenfd_ == INVALID_SOCKET_FD) {
+        if (listenfd_ == detail::INVALID_SOCKET_FD) {
             saveError("socket error", true);
             return false;
         }
 
-        if (!set_nonblocking(listenfd_)) {
+        if (!detail::set_nonblocking(listenfd_)) {
             close("set nonblock error", true);
             return false;
         }
 
         int yes = 1;
-        if (::setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<sockopt_val_t>(&yes),
-                         sizeof(yes)) < 0) {
+        if (::setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR,
+                         reinterpret_cast<detail::sockopt_val_t>(&yes), sizeof(yes)) < 0) {
             close("setsockopt SO_REUSEADDR error", true);
             return false;
         }
@@ -627,21 +748,32 @@ class SocketTcpServer {
         return true;
     }
 
-    void close(const char* reason, bool check_errno = false, int err_override = 0) {
-        if (listenfd_ != INVALID_SOCKET_FD) {
+    void close(const char* reason, bool check_errno = false, int err_override = 0) noexcept {
+        if (listenfd_ != detail::INVALID_SOCKET_FD) {
             saveError(reason, check_errno, err_override);
-            close_socket(listenfd_);
-            listenfd_ = INVALID_SOCKET_FD;
+            detail::close_socket(listenfd_);
+            listenfd_ = detail::INVALID_SOCKET_FD;
         }
     }
 
-    const char* getLastError() const { return last_error_; }
+    [[nodiscard]] const char* getLastError() const noexcept { return last_error_; }
 
-    bool isClosed() const { return listenfd_ == INVALID_SOCKET_FD; }
+    [[nodiscard]] bool isClosed() const noexcept { return listenfd_ == detail::INVALID_SOCKET_FD; }
 
-    uint32_t getConnCnt() const { return conns_cnt_; }
+    [[nodiscard]] uint32_t getConnCnt() const noexcept { return conns_cnt_; }
+
+    [[nodiscard]] uint16_t getLocalPort() const noexcept {
+        if (listenfd_ == detail::INVALID_SOCKET_FD) return 0;
+        struct sockaddr_in addr{};
+        socklen_t addrlen = sizeof(addr);
+        if (::getsockname(listenfd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
+            return 0;
+        }
+        return ntohs(addr.sin_port);
+    }
 
     template <typename Handler>
+        requires std::invocable<Handler&, Conn&>
     void foreachConn(Handler handler) {
         for (uint32_t i = 0; i < conns_cnt_; i++) {
             Conn& conn = *conns_[i];
@@ -649,15 +781,16 @@ class SocketTcpServer {
         }
     }
 
-    template <typename Handler>
+    template <TcpServerHandler<Conn> Handler>
     void poll(Handler& handler) {
-        int64_t now = std::time(nullptr);
+        int64_t now = detail::now_ms();
         while (!isClosed() && conns_cnt_ < Conf::MaxConns) {
             struct sockaddr_in clientaddr{};
             socklen_t addr_len = sizeof(clientaddr);
-            socket_t fd = ::accept(listenfd_, reinterpret_cast<struct sockaddr*>(&clientaddr), &addr_len);
-            if (fd == INVALID_SOCKET_FD) {
-                if (is_eintr(get_last_error())) continue;
+            detail::socket_t fd =
+                ::accept(listenfd_, reinterpret_cast<struct sockaddr*>(&clientaddr), &addr_len);
+            if (fd == detail::INVALID_SOCKET_FD) {
+                if (detail::is_eintr(detail::get_last_error())) continue;
                 break;
             }
             Conn& conn = *conns_[conns_cnt_];
@@ -679,11 +812,11 @@ class SocketTcpServer {
     }
 
    private:
-    void saveError(const char* msg, bool check_errno = true, int err_override = 0) {
-        format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
+    void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
+        detail::format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
     }
 
-    socket_t listenfd_ = INVALID_SOCKET_FD;
+    detail::socket_t listenfd_ = detail::INVALID_SOCKET_FD;
     uint32_t conns_cnt_ = 0;
     Conn* conns_[Conf::MaxConns]{};
     Conn conns_data_[Conf::MaxConns];
@@ -705,11 +838,11 @@ class SocketUdpReceiver {
 
     ~SocketUdpReceiver() { close("destruct"); }
 
-    bool init([[maybe_unused]] const char* interface_ip, const char* dest_ip, uint16_t dest_port,
-              const char* subscribe_ip = "") {
+    [[nodiscard]] bool init([[maybe_unused]] const char* interface_ip, const char* dest_ip,
+                            uint16_t dest_port, const char* subscribe_ip = "") noexcept {
         close("reinit");
 
-        if (!ensure_network_init()) {
+        if (!detail::ensure_network_init()) {
             saveError("WSAStartup failed", false);
             return false;
         }
@@ -731,23 +864,23 @@ class SocketUdpReceiver {
             return false;
         }
 
-        if ((fd_ = ::socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET_FD) {
+        if ((fd_ = ::socket(AF_INET, SOCK_DGRAM, 0)) == detail::INVALID_SOCKET_FD) {
             saveError("socket error", true);
             return false;
         }
 
-        if (!set_nonblocking(fd_)) {
+        if (!detail::set_nonblocking(fd_)) {
             close("set nonblock error", true);
             return false;
         }
 
 #ifdef _WIN32
-        disable_udp_connreset(fd_);
+        detail::disable_udp_connreset(fd_);
 #endif
 
         int optval = 1;
-        if (::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<sockopt_val_t>(&optval),
-                         sizeof(int)) < 0) {
+        if (::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR,
+                         reinterpret_cast<detail::sockopt_val_t>(&optval), sizeof(int)) < 0) {
             close("setsockopt SO_REUSEADDR error", true);
             return false;
         }
@@ -773,7 +906,7 @@ class SocketUdpReceiver {
             group.imr_multiaddr = dest_in_addr;
 
             if (::setsockopt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                             reinterpret_cast<sockopt_val_t>(&group), sizeof(group)) < 0) {
+                             reinterpret_cast<detail::sockopt_val_t>(&group), sizeof(group)) < 0) {
                 close("setsockopt IP_ADD_MEMBERSHIP failed", true);
                 return false;
             }
@@ -782,8 +915,8 @@ class SocketUdpReceiver {
         return true;
     }
 
-    uint16_t getLocalPort() const {
-        if (fd_ == INVALID_SOCKET_FD) return 0;
+    [[nodiscard]] uint16_t getLocalPort() const noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return 0;
         struct sockaddr_in addr{};
         socklen_t addrlen = sizeof(addr);
         if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
@@ -792,25 +925,25 @@ class SocketUdpReceiver {
         return ntohs(addr.sin_port);
     }
 
-    const char* getLastError() const { return last_error_; }
+    [[nodiscard]] const char* getLastError() const noexcept { return last_error_; }
 
-    bool isClosed() const { return fd_ == INVALID_SOCKET_FD; }
+    [[nodiscard]] bool isClosed() const noexcept { return fd_ == detail::INVALID_SOCKET_FD; }
 
-    void close(const char* reason, bool check_errno = false, int err_override = 0) {
-        if (fd_ != INVALID_SOCKET_FD) {
+    void close(const char* reason, bool check_errno = false, int err_override = 0) noexcept {
+        if (fd_ != detail::INVALID_SOCKET_FD) {
             saveError(reason, check_errno, err_override);
-            close_socket(fd_);
-            fd_ = INVALID_SOCKET_FD;
+            detail::close_socket(fd_);
+            fd_ = detail::INVALID_SOCKET_FD;
         }
     }
 
-    template <typename Handler>
-    bool read(Handler handler) {
-        if (fd_ == INVALID_SOCKET_FD) return false;
+    template <UdpReadHandler Handler>
+    [[nodiscard]] bool read(Handler handler) {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
         int n = 0;
         do {
             n = ::recv(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0);
-        } while (n < 0 && is_eintr(get_last_error()));
+        } while (n < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (n > 0) {
             handler(buf_, static_cast<uint32_t>(n));
@@ -819,16 +952,16 @@ class SocketUdpReceiver {
         return false;
     }
 
-    template <typename Handler>
-    bool recvfrom(Handler handler) {
-        if (fd_ == INVALID_SOCKET_FD) return false;
+    template <UdpRecvFromHandler Handler>
+    [[nodiscard]] bool recvfrom(Handler handler) {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
         struct sockaddr_in src_addr{};
         socklen_t addrlen = sizeof(src_addr);
         int n = 0;
         do {
             n = ::recvfrom(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0,
                            reinterpret_cast<struct sockaddr*>(&src_addr), &addrlen);
-        } while (n < 0 && is_eintr(get_last_error()));
+        } while (n < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (n > 0) {
             handler(buf_, static_cast<uint32_t>(n), src_addr);
@@ -837,23 +970,35 @@ class SocketUdpReceiver {
         return false;
     }
 
-    bool sendto(const void* data, uint32_t size, const sockaddr_in& dst_addr) {
-        if (fd_ == INVALID_SOCKET_FD) return false;
+    [[nodiscard]] bool sendto(const void* data, uint32_t size,
+                              const sockaddr_in& dst_addr) noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
         if (size > static_cast<uint32_t>(std::numeric_limits<int>::max())) return false;
         int ret = 0;
         do {
             ret = ::sendto(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
                            reinterpret_cast<const struct sockaddr*>(&dst_addr), sizeof(dst_addr));
-        } while (ret < 0 && is_eintr(get_last_error()));
+        } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
         return ret == static_cast<int>(size);
     }
 
-   private:
-    void saveError(const char* msg, bool check_errno = true, int err_override = 0) {
-        format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
+    [[nodiscard]] bool sendto(std::span<const std::byte> data,
+                              const sockaddr_in& dst_addr) noexcept {
+        if (data.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
+        return sendto(data.data(), static_cast<uint32_t>(data.size()), dst_addr);
     }
 
-    socket_t fd_ = INVALID_SOCKET_FD;
+    [[nodiscard]] bool sendto(std::span<const uint8_t> data,
+                              const sockaddr_in& dst_addr) noexcept {
+        return sendto(std::as_bytes(data), dst_addr);
+    }
+
+   private:
+    void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
+        detail::format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
+    }
+
+    detail::socket_t fd_ = detail::INVALID_SOCKET_FD;
     uint8_t buf_[RecvBufSize]{};
     char last_error_[128] = "";
 };
@@ -868,11 +1013,12 @@ class SocketUdpSender {
 
     ~SocketUdpSender() { close("destruct"); }
 
-    bool init([[maybe_unused]] const char* interface_ip, const char* local_ip, uint16_t local_port,
-              const char* dest_ip, uint16_t dest_port) {
+    [[nodiscard]] bool init([[maybe_unused]] const char* interface_ip, const char* local_ip,
+                            uint16_t local_port, const char* dest_ip,
+                            uint16_t dest_port) noexcept {
         close("reinit");
 
-        if (!ensure_network_init()) {
+        if (!detail::ensure_network_init()) {
             saveError("WSAStartup failed", false);
             return false;
         }
@@ -901,18 +1047,18 @@ class SocketUdpSender {
             return false;
         }
 
-        if ((fd_ = ::socket(AF_INET, SOCK_DGRAM, 0)) == INVALID_SOCKET_FD) {
+        if ((fd_ = ::socket(AF_INET, SOCK_DGRAM, 0)) == detail::INVALID_SOCKET_FD) {
             saveError("socket error", true);
             return false;
         }
 
-        if (!set_nonblocking(fd_)) {
+        if (!detail::set_nonblocking(fd_)) {
             close("set nonblock error", true);
             return false;
         }
 
 #ifdef _WIN32
-        disable_udp_connreset(fd_);
+        detail::disable_udp_connreset(fd_);
 #endif
 
         if (::bind(fd_, reinterpret_cast<const struct sockaddr*>(&localaddr), sizeof(localaddr)) < 0) {
@@ -926,8 +1072,8 @@ class SocketUdpSender {
         }
 
         int ttl = 64;
-        if (::setsockopt(fd_, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<sockopt_val_t>(&ttl),
-                         sizeof(ttl)) < 0) {
+        if (::setsockopt(fd_, IPPROTO_IP, IP_MULTICAST_TTL,
+                         reinterpret_cast<detail::sockopt_val_t>(&ttl), sizeof(ttl)) < 0) {
             close("setsockopt IP_MULTICAST_TTL failed", true);
             return false;
         }
@@ -935,8 +1081,8 @@ class SocketUdpSender {
         return true;
     }
 
-    uint16_t getLocalPort() const {
-        if (fd_ == INVALID_SOCKET_FD) return 0;
+    [[nodiscard]] uint16_t getLocalPort() const noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return 0;
         struct sockaddr_in addr{};
         socklen_t addrlen = sizeof(addr);
         if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
@@ -945,33 +1091,44 @@ class SocketUdpSender {
         return ntohs(addr.sin_port);
     }
 
-    const char* getLastError() const { return last_error_; }
+    [[nodiscard]] const char* getLastError() const noexcept { return last_error_; }
 
-    bool isClosed() const { return fd_ == INVALID_SOCKET_FD; }
+    [[nodiscard]] bool isClosed() const noexcept { return fd_ == detail::INVALID_SOCKET_FD; }
 
-    void close(const char* reason, bool check_errno = false, int err_override = 0) {
-        if (fd_ != INVALID_SOCKET_FD) {
+    void close(const char* reason, bool check_errno = false, int err_override = 0) noexcept {
+        if (fd_ != detail::INVALID_SOCKET_FD) {
             saveError(reason, check_errno, err_override);
-            close_socket(fd_);
-            fd_ = INVALID_SOCKET_FD;
+            detail::close_socket(fd_);
+            fd_ = detail::INVALID_SOCKET_FD;
         }
     }
 
-    bool write(const void* data, uint32_t size) {
-        if (fd_ == INVALID_SOCKET_FD) return false;
+    [[nodiscard]] bool write(const void* data, uint32_t size) noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return false;
         if (size > static_cast<uint32_t>(std::numeric_limits<int>::max())) return false;
         int ret = 0;
         do {
             ret = ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0);
-        } while (ret < 0 && is_eintr(get_last_error()));
+        } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
         return ret == static_cast<int>(size);
     }
 
-   private:
-    void saveError(const char* msg, bool check_errno = true, int err_override = 0) {
-        format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
+    [[nodiscard]] bool write(std::span<const std::byte> data) noexcept {
+        if (data.size() > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
+        return write(data.data(), static_cast<uint32_t>(data.size()));
     }
 
-    socket_t fd_ = INVALID_SOCKET_FD;
+    [[nodiscard]] bool write(std::span<const uint8_t> data) noexcept {
+        return write(std::as_bytes(data));
+    }
+
+   private:
+    void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
+        detail::format_socket_error(last_error_, sizeof(last_error_), msg, check_errno, err_override);
+    }
+
+    detail::socket_t fd_ = detail::INVALID_SOCKET_FD;
     char last_error_[128] = "";
 };
+
+}  // namespace pollnet
