@@ -663,16 +663,26 @@ bool test_tcp_connect_fail_and_allow_reconnect() {
         }
     } cli_h;
 
+#ifdef _WIN32
+    // Windows TCP 协议栈在未监听回环端口上会重传 SYN，约 2~2.5s 后才上报 WSAECONNREFUSED
+    constexpr int kConnectFailBudgetMs = 8000;
+#else
+    constexpr int kConnectFailBudgetMs = 2000;
+#endif
+
     auto start = std::chrono::steady_clock::now();
-    CHECK(poll_until([&]() {
-        client.poll(cli_h);
-        return cli_h.failed >= 1;
-    }));
+    CHECK(poll_until(
+        [&]() {
+            client.poll(cli_h);
+            return cli_h.failed >= 1;
+        },
+        kConnectFailBudgetMs));
     auto elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
             .count();
-    CHECK(elapsed_ms < 2000);
+    CHECK(elapsed_ms < kConnectFailBudgetMs);
     CHECK(!client.lastError().empty());
+    CHECK(client.lastError() != "connect expired");
 
     CHECK(server.listen({.host = "127.0.0.1", .port = port}));
     client.allowReconnect();

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pollnet VERSION 2.0.2 LANGUAGES CXX)
+project(pollnet VERSION 2.0.3 LANGUAGES CXX)
 
 string(COMPARE EQUAL "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}" POLLNET_IS_TOP_LEVEL)
 
