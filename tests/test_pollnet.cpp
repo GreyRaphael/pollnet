@@ -14,9 +14,6 @@
 
 #include "pollnet/eventloop.h"
 #include "pollnet/socket.h"
-#ifdef __linux__
-#include "pollnet/iouring.h"
-#endif
 
 namespace {
 
@@ -76,27 +73,20 @@ static_assert(!std::is_copy_assignable_v<pollnet::EventLoopTcpServer<>>);
 static_assert(!std::is_move_constructible_v<pollnet::EventLoopTcpServer<>>);
 static_assert(!std::is_move_assignable_v<pollnet::EventLoopTcpServer<>>);
 
-#ifdef __linux__
-static_assert(!std::is_copy_constructible_v<pollnet::IoUringTcpServer<>>);
-static_assert(!std::is_copy_assignable_v<pollnet::IoUringTcpServer<>>);
-static_assert(!std::is_move_constructible_v<pollnet::IoUringTcpServer<>>);
-static_assert(!std::is_move_assignable_v<pollnet::IoUringTcpServer<>>);
-#endif
-
 static_assert(!std::is_copy_constructible_v<pollnet::UdpSocket<>>);
 static_assert(!std::is_copy_assignable_v<pollnet::UdpSocket<>>);
 static_assert(!std::is_move_constructible_v<pollnet::UdpSocket<>>);
 static_assert(!std::is_move_assignable_v<pollnet::UdpSocket<>>);
 
-static_assert(!std::is_copy_constructible_v<pollnet::UdpReceiver<>>);
-static_assert(!std::is_copy_assignable_v<pollnet::UdpReceiver<>>);
-static_assert(!std::is_move_constructible_v<pollnet::UdpReceiver<>>);
-static_assert(!std::is_move_assignable_v<pollnet::UdpReceiver<>>);
-
-static_assert(!std::is_copy_constructible_v<pollnet::UdpSender>);
-static_assert(!std::is_copy_assignable_v<pollnet::UdpSender>);
-static_assert(!std::is_move_constructible_v<pollnet::UdpSender>);
-static_assert(!std::is_move_assignable_v<pollnet::UdpSender>);
+// ByteRange 与 IoSlice 约束验证
+static_assert(pollnet::ByteRange<std::span<const uint8_t>>);
+static_assert(pollnet::ByteRange<std::span<const std::byte>>);
+static_assert(pollnet::ByteRange<std::string_view>);
+static_assert(pollnet::ByteRange<std::string>);
+static_assert(pollnet::ByteRange<std::vector<uint8_t>>);
+static_assert(pollnet::ByteRange<std::array<uint8_t, 4>>);
+static_assert(!pollnet::ByteRange<const char (&)[6]>);
+static_assert(!pollnet::ByteRange<std::array<pollnet::IoSlice, 2>>);
 
 // 最小跨后端契约与可选回调 Concept 验证
 static_assert(pollnet::TcpConnectionLike<DefaultConn>);
@@ -181,43 +171,29 @@ bool test_invalid_options_and_reinit() {
     CHECK(server.localPort() == 0);
 
     CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
-    uint16_t port1 = server.localPort();
-    CHECK(port1 != 0);
+    CHECK(server.localPort() != 0);
     CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
     CHECK(server.localPort() != 0);
     CHECK(!server.isClosed());
 
-    pollnet::UdpReceiver<> rx;
-    CHECK(!rx.open({.bind_ip = "bad_ip", .bind_port = 0}));
-    CHECK(!rx.open({.bind_ip = "127.0.0.1", .bind_port = 0, .multicast_interface_ip = "bad"}));
-    CHECK(rx.isClosed());
-    CHECK(rx.localPort() == 0);
-    CHECK(rx.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
-    CHECK(rx.localPort() != 0);
-    CHECK(rx.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
-    CHECK(!rx.isClosed());
-
-    pollnet::UdpSender tx;
-    CHECK(!tx.open({.local_ip = "127.0.0.1", .dest_ip = "", .dest_port = rx.localPort()}));
-    CHECK(!tx.open({.local_ip = "bad", .dest_ip = "127.0.0.1", .dest_port = rx.localPort()}));
-    CHECK(!tx.open({.local_ip = "127.0.0.1", .dest_ip = "bad", .dest_port = rx.localPort()}));
-    CHECK(tx.isClosed());
-    CHECK(tx.open({.local_ip = "127.0.0.1", .dest_ip = "127.0.0.1", .dest_port = rx.localPort()}));
-    CHECK(tx.localPort() != 0);
-    CHECK(tx.open({.local_ip = "127.0.0.1", .dest_ip = "127.0.0.1", .dest_port = rx.localPort()}));
-    CHECK(!tx.isClosed());
-
     pollnet::UdpSocket<> sock;
     CHECK(!sock.open({.bind_ip = "bad"}));
+    CHECK(!sock.lastError().empty());
     CHECK(!sock.open({.bind_ip = "127.0.0.1", .dest_ip = "bad"}));
     CHECK(!sock.open({.bind_ip = "127.0.0.1", .multicast_group_ip = "bad"}));
     CHECK(!sock.open({.bind_ip = "127.0.0.1",
                       .multicast_group_ip = "239.0.0.1",
                       .multicast_interface_ip = "bad"}));
     CHECK(sock.isClosed());
+    CHECK(sock.localPort() == 0);
     CHECK(sock.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
     CHECK(sock.isOpen());
     CHECK(sock.localPort() != 0);
+    CHECK(sock.open({.bind_ip = "127.0.0.1",
+                     .bind_port = 0,
+                     .dest_ip = "127.0.0.1",
+                     .dest_port = 1234}));
+    CHECK(sock.isOpen());
 
     return true;
 }
@@ -378,10 +354,10 @@ bool test_tcp_minimal_and_full_handler() {
 }
 
 // ==========================================
-// 5. 内核调优参数与 TCP writev 向量写测试
+// 5. 内核调优参数与统一 IoSlice 向量写测试
 // ==========================================
 
-bool test_tcp_tuning_and_writev() {
+bool test_tcp_tuning_and_vector_write() {
     pollnet::TcpServer<> server;
     CHECK(server.listen({.host = "127.0.0.1",
                          .port = 0,
@@ -405,7 +381,7 @@ bool test_tcp_tuning_and_writev() {
             recv_all.append(reinterpret_cast<const char*>(data.data()), data.size());
             const std::string_view p1 = "ack:";
             std::array<pollnet::IoSlice, 2> iov{{{p1}, {data}}};
-            [[maybe_unused]] bool ok = conn.writevNonblock(iov);
+            [[maybe_unused]] bool ok = conn.writeNonblock(iov);
             return data.size();
         }
     } srv_h;
@@ -424,26 +400,24 @@ bool test_tcp_tuning_and_writev() {
         return client.isConnected() && server.connCount() == 1;
     }));
 
-    // 混合空 slice、string_view、span<uint8_t>、span<std::byte>
     const std::string s1 = "vec-";
     const std::array<uint8_t, 3> s2{'i', 'o', '-'};
     const std::array<std::byte, 2> s3{std::byte{'o'}, std::byte{'k'}};
     std::array<pollnet::IoSlice, 5> slices{{
         {nullptr, 0},
         {s1},
-        {std::span<const uint8_t>{s2}},
+        {s2},
         {nullptr, 0},
-        {std::span<const std::byte>{s3}},
+        {s3},
     }};
-    CHECK(client.writevNonblock(slices));
+    CHECK(client.writeNonblock(slices));
 
-    // 再测 writev 多片写入（超过 64 个 slice 验证分块逻辑）
     std::vector<pollnet::IoSlice> many_slices;
     const std::string unit = "X";
     for (int i = 0; i < 70; ++i) {
         many_slices.emplace_back(unit);
     }
-    CHECK(client.writev(many_slices));
+    CHECK(client.write(many_slices));
 
     const std::string expected_srv = "vec-io-ok" + std::string(70, 'X');
     CHECK(poll_until([&]() {
@@ -516,7 +490,7 @@ bool test_tcp_framing_and_compaction() {
         auto f = make_frame(s);
         coalesced.insert(coalesced.end(), f.begin(), f.end());
     }
-    CHECK(client.write(std::span<const uint8_t>{coalesced}));
+    CHECK(client.write(coalesced));
     CHECK(poll_until([&]() {
         server.poll(srv_h);
         return srv_h.frames.size() == 3;
@@ -544,7 +518,7 @@ bool test_tcp_framing_and_compaction() {
     batch.insert(batch.end(), f10.begin(), f10.end());
     batch.insert(batch.end(), f60.begin(), f60.begin() + 54);
     CHECK(batch.size() == 64);
-    CHECK(client.write(std::span<const uint8_t>{batch}));
+    CHECK(client.write(batch));
 
     CHECK(poll_until([&]() {
         server.poll(srv_h);
@@ -649,7 +623,7 @@ bool test_tcp_bad_consumed_and_buf_full() {
 
         std::array<uint8_t, 64> fill{};
         fill.fill(0x5A);
-        CHECK(client.write(std::span<const uint8_t>{fill}));
+        CHECK(client.write(fill));
         CHECK(poll_until([&]() {
             server.poll(srv_h);
             return srv_h.disconnected == 1;
@@ -900,16 +874,14 @@ bool test_tcp_max_conns_and_slot_reuse() {
 }
 
 // ==========================================
-// 11. 通用服务端后端验证（EventLoopTcpServer & IoUringTcpServer）
+// 11. EventLoopTcpServer 测试
 // ==========================================
 
-template <template <typename, size_t, size_t> class ServerT>
-bool test_server_backend_suite() {
+bool test_eventloop_backend() {
     using namespace std::chrono_literals;
-    using Srv = ServerT<pollnet::EmptyUserData, 64, 2>;
+    using Srv = pollnet::EventLoopTcpServer<pollnet::EmptyUserData, 64, 2>;
     using Cli = pollnet::TcpClient<pollnet::EmptyUserData, 64>;
 
-    // 11a. allowNewConnection、粘包/半包、MaxConns 槽位复用与 foreachConn
     {
         Srv server;
         CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
@@ -930,9 +902,9 @@ bool test_server_backend_suite() {
                 }
                 return true;
             }
-            void onConnect(typename Srv::Conn&) { ++connected; }
-            void onDisconnect(typename Srv::Conn&) { ++disconnected; }
-            size_t onData(typename Srv::Conn& conn, std::span<const uint8_t> data) {
+            void onConnect(Srv::Conn&) { ++connected; }
+            void onDisconnect(Srv::Conn&) { ++disconnected; }
+            size_t onData(Srv::Conn& conn, std::span<const uint8_t> data) {
                 size_t offset = 0;
                 while (data.size() - offset >= sizeof(uint32_t)) {
                     uint32_t len = 0;
@@ -988,17 +960,16 @@ bool test_server_backend_suite() {
         CHECK(server.connCount() == 2);
 
         size_t iter_cnt = 0;
-        server.foreachConn([&](typename Srv::Conn&) { ++iter_cnt; });
+        server.foreachConn([&](Srv::Conn&) { ++iter_cnt; });
         CHECK(iter_cnt == 2);
 
-        // 粘包 + 半包发送
         auto f1 = make_frame("ev1");
         auto f2 = make_frame("ev2");
         CHECK(c1.write(f1.data(), 2));
         server.poll(srv_h, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         CHECK(c1.write(f1.data() + 2, f1.size() - 2));
-        CHECK(c1.write(std::span<const uint8_t>{f2}));
+        CHECK(c1.write(f2));
         CHECK(poll_until([&]() {
             server.poll(srv_h, 0);
             c1.poll(h1);
@@ -1007,7 +978,6 @@ bool test_server_backend_suite() {
         CHECK(srv_h.frames[0] == "ev1");
         CHECK(srv_h.frames[1] == "ev2");
 
-        // 第 3 个客户端在满槽时不得接纳
         CHECK(c3.connect({.host = "127.0.0.1", .port = port}));
         for (int i = 0; i < 30; ++i) {
             server.poll(srv_h, 0);
@@ -1017,7 +987,6 @@ bool test_server_backend_suite() {
         CHECK(server.connCount() == 2);
         CHECK(srv_h.connected == 2);
 
-        // 断开 c1 释放槽位并接纳 c3
         c1.close("release");
         CHECK(poll_until([&]() {
             server.poll(srv_h, 0);
@@ -1027,7 +996,7 @@ bool test_server_backend_suite() {
         CHECK(server.connCount() == 2);
 
         auto f3 = make_frame("c3-ok");
-        CHECK(c3.write(std::span<const uint8_t>{f3}));
+        CHECK(c3.write(f3));
         CHECK(poll_until([&]() {
             server.poll(srv_h, 0);
             c3.poll(h3);
@@ -1036,7 +1005,6 @@ bool test_server_backend_suite() {
         CHECK(srv_h.frames[2] == "c3-ok");
     }
 
-    // 11b. recv_timeout 触发与关闭后槽位回收
     {
         Srv server;
         CHECK(server.listen({.host = "127.0.0.1", .port = 0, .recv_timeout = 120ms}));
@@ -1049,15 +1017,13 @@ bool test_server_backend_suite() {
             int connected = 0;
             int recv_timeouts = 0;
             int disconnected = 0;
-            void onConnect(typename Srv::Conn&) { ++connected; }
-            void onDisconnect(typename Srv::Conn&) { ++disconnected; }
-            void onRecvTimeout(typename Srv::Conn& c) {
+            void onConnect(Srv::Conn&) { ++connected; }
+            void onDisconnect(Srv::Conn&) { ++disconnected; }
+            void onRecvTimeout(Srv::Conn& c) {
                 ++recv_timeouts;
                 c.close("timeout");
             }
-            size_t onData(typename Srv::Conn&, std::span<const uint8_t> data) {
-                return data.size();
-            }
+            size_t onData(Srv::Conn&, std::span<const uint8_t> data) { return data.size(); }
         } srv_h;
 
         struct IdleCli {
@@ -1081,7 +1047,6 @@ bool test_server_backend_suite() {
         }));
         CHECK(server.connCount() == 0);
 
-        // 验证超时回收槽位后可继续接纳新连接
         Cli client2;
         IdleCli cli_h2;
         CHECK(client2.connect({.host = "127.0.0.1", .port = port}));
@@ -1095,19 +1060,13 @@ bool test_server_backend_suite() {
     return true;
 }
 
-bool test_eventloop_backend() { return test_server_backend_suite<pollnet::EventLoopTcpServer>(); }
-
-#ifdef __linux__
-bool test_iouring_backend() { return test_server_backend_suite<pollnet::IoUringTcpServer>(); }
-#endif
-
 // ==========================================
-// 12. UDP 单包与批量收发回环测试
+// 12. 统一 UdpSocket 单包与批量收发测试
 // ==========================================
 
 bool test_udp_loopback_and_batch() {
-    pollnet::UdpReceiver<1500> rx1;
-    pollnet::UdpReceiver<1500> rx2;
+    pollnet::UdpSocket<1500> rx1;
+    pollnet::UdpSocket<1500> rx2;
     CHECK(rx1.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
     CHECK(rx2.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
 
@@ -1115,9 +1074,9 @@ bool test_udp_loopback_and_batch() {
     uint16_t rx2_port = rx2.localPort();
     CHECK(rx1_port != 0 && rx2_port != 0);
 
-    pollnet::UdpSender tx;
-    CHECK(tx.open({.local_ip = "127.0.0.1",
-                   .local_port = 0,
+    pollnet::UdpSocket<1500> tx;
+    CHECK(tx.open({.bind_ip = "127.0.0.1",
+                   .bind_port = 0,
                    .dest_ip = "127.0.0.1",
                    .dest_port = rx1_port}));
     uint16_t tx_port = tx.localPort();
@@ -1143,7 +1102,7 @@ bool test_udp_loopback_and_batch() {
     for (char c : ping2) {
         byte_payload.push_back(static_cast<std::byte>(c));
     }
-    CHECK(tx.send(std::span<const std::byte>{byte_payload}));
+    CHECK(tx.send(byte_payload));
 
     std::string rx1_msg2;
     CHECK(poll_until([&]() {
@@ -1156,7 +1115,7 @@ bool test_udp_loopback_and_batch() {
     auto dst_rx2 = pollnet::Endpoint::loopback(rx2_port);
     const std::string pong = "udp-pong-span";
     std::vector<uint8_t> pong_bytes(pong.begin(), pong.end());
-    CHECK(rx1.sendTo(std::span<const uint8_t>{pong_bytes}, dst_rx2));
+    CHECK(rx1.sendTo(pong_bytes, dst_rx2));
 
     std::string rx2_msg;
     CHECK(poll_until([&]() {
@@ -1166,14 +1125,10 @@ bool test_udp_loopback_and_batch() {
     }));
     CHECK(rx2_msg == pong);
 
-    // 批量发送 sendBatch + sendToBatch + recvBatch + recvFromBatch
     const std::array<std::string, 4> batch_msgs = {"b0", "b1", "b2", "b3"};
-    std::array<std::span<const uint8_t>, 4> batch_spans;
-    for (size_t i = 0; i < 4; ++i) {
-        batch_spans[i] = std::span<const uint8_t>{
-            reinterpret_cast<const uint8_t*>(batch_msgs[i].data()), batch_msgs[i].size()};
-    }
-    CHECK(tx.sendBatch(batch_spans) == 4);
+    std::array<pollnet::IoSlice, 4> batch_slices{
+        batch_msgs[0], batch_msgs[1], batch_msgs[2], batch_msgs[3]};
+    CHECK(tx.sendBatch(batch_slices) == 4);
 
     std::vector<std::string> got_batch;
     CHECK(poll_until([&]() {
@@ -1184,7 +1139,7 @@ bool test_udp_loopback_and_batch() {
     }));
     CHECK(got_batch[0] == "b0" && got_batch[3] == "b3");
 
-    CHECK(rx1.sendToBatch(batch_spans, dst_rx2) == 4);
+    CHECK(rx1.sendToBatch(batch_slices, dst_rx2) == 4);
     std::vector<std::string> got_batch2;
     CHECK(poll_until([&]() {
         [[maybe_unused]] size_t n = rx2.recvFromBatch<8>(
@@ -1197,38 +1152,6 @@ bool test_udp_loopback_and_batch() {
         return got_batch2.size() == 4;
     }));
     CHECK(got_batch2[1] == "b1" && got_batch2[2] == "b2");
-
-    // 统一 UdpSocket 批量与单包收发
-    pollnet::UdpSocket<1500> u1;
-    pollnet::UdpSocket<1500> u2;
-    CHECK(u1.open({.bind_ip = "127.0.0.1", .bind_port = 0}));
-    CHECK(u2.open({.bind_ip = "127.0.0.1",
-                   .bind_port = 0,
-                   .dest_ip = "127.0.0.1",
-                   .dest_port = u1.localPort()}));
-
-    CHECK(u2.sendBatch(batch_spans) == 4);
-    std::vector<std::string> u1_batch;
-    pollnet::Endpoint u2_ep;
-    CHECK(poll_until([&]() {
-        [[maybe_unused]] size_t n = u1.recvFromBatch<8>(
-            [&](std::span<const uint8_t> data, const pollnet::Endpoint& peer) {
-                u1_batch.emplace_back(reinterpret_cast<const char*>(data.data()), data.size());
-                u2_ep = peer;
-            });
-        return u1_batch.size() == 4;
-    }));
-    CHECK(u2_ep.port() == u2.localPort());
-
-    const std::string u1_to_u2 = "unified-sendto";
-    CHECK(u1.sendTo(u1_to_u2.data(), u1_to_u2.size(), u2_ep));
-    std::string u2_got;
-    CHECK(poll_until([&]() {
-        return u2.recv([&](std::span<const uint8_t> data) {
-            u2_got.assign(reinterpret_cast<const char*>(data.data()), data.size());
-        });
-    }));
-    CHECK(u2_got == u1_to_u2);
 
     return true;
 }
@@ -1245,16 +1168,13 @@ int main() {
         {"endpoint", test_endpoint},
         {"invalid_options_and_reinit", test_invalid_options_and_reinit},
         {"tcp_minimal_and_full_handler", test_tcp_minimal_and_full_handler},
-        {"tcp_tuning_and_writev", test_tcp_tuning_and_writev},
+        {"tcp_tuning_and_vector_write", test_tcp_tuning_and_vector_write},
         {"tcp_framing_and_compaction", test_tcp_framing_and_compaction},
         {"tcp_bad_consumed_and_buf_full", test_tcp_bad_consumed_and_buf_full},
         {"tcp_connect_fail_and_allow_reconnect", test_tcp_connect_fail_and_allow_reconnect},
         {"tcp_subsecond_timeouts_and_custom_clock", test_tcp_subsecond_timeouts_and_custom_clock},
         {"tcp_max_conns_and_slot_reuse", test_tcp_max_conns_and_slot_reuse},
         {"eventloop_backend", test_eventloop_backend},
-#ifdef __linux__
-        {"iouring_backend", test_iouring_backend},
-#endif
         {"udp_loopback_and_batch", test_udp_loopback_and_batch},
     };
 

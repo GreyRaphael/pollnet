@@ -43,7 +43,7 @@ endif()
 
 if(POLLNET_BUILD_BENCHMARKS)
     find_package(Threads REQUIRED)
-    add_executable(pollnet_bench benchmarks/bench_v2.cpp)
+    add_executable(pollnet_bench benchmarks/bench.cpp)
     target_include_directories(pollnet_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks)
     target_link_libraries(pollnet_bench PRIVATE pollnet Threads::Threads)
     target_compile_options(pollnet_bench PRIVATE

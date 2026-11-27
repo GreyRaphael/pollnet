@@ -15,9 +15,6 @@
 #include "bench_common.h"
 #include "pollnet/eventloop.h"
 #include "pollnet/socket.h"
-#ifdef __linux__
-#include "pollnet/iouring.h"
-#endif
 
 namespace {
 
@@ -36,7 +33,7 @@ bool run_tcp_ping_pong_server(const pollnet_bench::BenchConfig& cfg, std::string
         pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
         Server server;
         if (!server.listen({.host = "127.0.0.1", .port = 0, .tcp_quickack = quickack})) {
-            std::cerr << std::format("[v2] {} listen failed: {}\n", label, server.lastError());
+            std::cerr << std::format("[bench] {} listen failed: {}\n", label, server.lastError());
             srv_failed.store(true, std::memory_order_release);
             return;
         }
@@ -78,7 +75,8 @@ bool run_tcp_ping_pong_server(const pollnet_bench::BenchConfig& cfg, std::string
     if (!client.connect({.host = "127.0.0.1",
                          .port = port.load(std::memory_order_acquire),
                          .tcp_quickack = quickack})) {
-        std::cerr << std::format("[v2] {} client connect failed: {}\n", label, client.lastError());
+        std::cerr << std::format("[bench] {} client connect failed: {}\n", label,
+                                 client.lastError());
         stop.store(true, std::memory_order_relaxed);
         srv_thread.join();
         return false;
@@ -116,7 +114,7 @@ bool run_tcp_ping_pong_server(const pollnet_bench::BenchConfig& cfg, std::string
         cli_handler.got_reply = false;
         int64_t t0 = pollnet_bench::bench_now_ns();
         if (!client.writeNonblock(send_buf)) {
-            std::cerr << std::format("[v2] {} writeNonblock failed: {}\n", label,
+            std::cerr << std::format("[bench] {} writeNonblock failed: {}\n", label,
                                      client.lastError());
             stop.store(true, std::memory_order_relaxed);
             srv_thread.join();
@@ -125,7 +123,7 @@ bool run_tcp_ping_pong_server(const pollnet_bench::BenchConfig& cfg, std::string
         while (!cli_handler.got_reply) {
             poll_client();
             if (!client.isConnected()) {
-                std::cerr << std::format("[v2] {} client disconnected: {}\n", label,
+                std::cerr << std::format("[bench] {} client disconnected: {}\n", label,
                                          client.lastError());
                 stop.store(true, std::memory_order_relaxed);
                 srv_thread.join();
@@ -160,7 +158,7 @@ bool run_tcp_64conn_ping_pong(const pollnet_bench::BenchConfig& cfg, std::string
         pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
         Server server;
         if (!server.listen({.host = "127.0.0.1", .port = 0})) {
-            std::cerr << std::format("[v2] {} listen failed: {}\n", label, server.lastError());
+            std::cerr << std::format("[bench] {} listen failed: {}\n", label, server.lastError());
             srv_failed.store(true, std::memory_order_release);
             return;
         }
@@ -282,7 +280,7 @@ bool run_tcp_throughput(const pollnet_bench::BenchConfig& cfg, std::string_view 
         pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
         Server server;
         if (!server.listen({.host = "127.0.0.1", .port = 0})) {
-            std::cerr << std::format("[v2] {} listen failed: {}\n", label, server.lastError());
+            std::cerr << std::format("[bench] {} listen failed: {}\n", label, server.lastError());
             srv_failed.store(true, std::memory_order_release);
             return;
         }
@@ -350,8 +348,9 @@ bool run_tcp_throughput(const pollnet_bench::BenchConfig& cfg, std::string_view 
     int64_t t0 = pollnet_bench::bench_now_ns();
     if constexpr (UseWritev) {
         for (size_t i = 0; i < target_msgs; i += kWritevBatch) {
-            if (!client.writev(batch_slices)) {
-                std::cerr << std::format("[v2] {} write failed: {}\n", label, client.lastError());
+            if (!client.write(batch_slices)) {
+                std::cerr << std::format("[bench] {} write failed: {}\n", label,
+                                         client.lastError());
                 stop.store(true, std::memory_order_relaxed);
                 srv_thread.join();
                 return false;
@@ -360,7 +359,8 @@ bool run_tcp_throughput(const pollnet_bench::BenchConfig& cfg, std::string_view 
     } else {
         for (size_t i = 0; i < target_msgs; ++i) {
             if (!client.write(send_buf)) {
-                std::cerr << std::format("[v2] {} write failed: {}\n", label, client.lastError());
+                std::cerr << std::format("[bench] {} write failed: {}\n", label,
+                                         client.lastError());
                 stop.store(true, std::memory_order_relaxed);
                 srv_thread.join();
                 return false;
@@ -370,7 +370,7 @@ bool run_tcp_throughput(const pollnet_bench::BenchConfig& cfg, std::string_view 
     while (!cli_handler.ack_received) {
         client.poll(cli_handler);
         if (!client.isConnected()) {
-            std::cerr << std::format("[v2] {} client closed before ack: {}\n", label,
+            std::cerr << std::format("[bench] {} client closed before ack: {}\n", label,
                                      client.lastError());
             stop.store(true, std::memory_order_relaxed);
             srv_thread.join();
@@ -394,9 +394,10 @@ bool run_udp_ping_pong(const pollnet_bench::BenchConfig& cfg) {
 
     std::thread srv_thread([&]() {
         pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
-        pollnet::UdpReceiver<2048> server;
+        pollnet::UdpSocket<2048> server;
         if (!server.open({.bind_ip = "127.0.0.1", .bind_port = 0})) {
-            std::cerr << std::format("[v2] udp_pp server open failed: {}\n", server.lastError());
+            std::cerr << std::format("[bench] udp_pp server open failed: {}\n",
+                                     server.lastError());
             srv_failed.store(true, std::memory_order_release);
             return;
         }
@@ -418,7 +419,7 @@ bool run_udp_ping_pong(const pollnet_bench::BenchConfig& cfg) {
         return false;
     }
 
-    pollnet::UdpReceiver<2048> client;
+    pollnet::UdpSocket<2048> client;
     if (!client.open({.bind_ip = "127.0.0.1", .bind_port = 0})) {
         stop.store(true, std::memory_order_relaxed);
         srv_thread.join();
@@ -481,9 +482,9 @@ bool run_udp_throughput(const pollnet_bench::BenchConfig& cfg, std::string_view 
 
     std::thread srv_thread([&]() {
         pollnet_bench::pin_current_thread(cfg.server_cpu, "server");
-        pollnet::UdpReceiver<2048> server;
+        pollnet::UdpSocket<2048> server;
         if (!server.open({.bind_ip = "127.0.0.1", .bind_port = 0})) {
-            std::cerr << std::format("[v2] {} server open failed: {}\n", rx_label,
+            std::cerr << std::format("[bench] {} server open failed: {}\n", rx_label,
                                      server.lastError());
             srv_failed.store(true, std::memory_order_release);
             return;
@@ -537,9 +538,9 @@ bool run_udp_throughput(const pollnet_bench::BenchConfig& cfg, std::string_view 
         return false;
     }
 
-    pollnet::UdpSender sender;
-    if (!sender.open({.local_ip = "127.0.0.1",
-                      .local_port = 0,
+    pollnet::UdpSocket<2048> sender;
+    if (!sender.open({.bind_ip = "127.0.0.1",
+                      .bind_port = 0,
                       .dest_ip = "127.0.0.1",
                       .dest_port = port.load(std::memory_order_acquire)})) {
         sender_done.store(true, std::memory_order_release);
@@ -549,17 +550,16 @@ bool run_udp_throughput(const pollnet_bench::BenchConfig& cfg, std::string_view 
 
     std::vector<uint8_t> send_buf(cfg.payload, 0x77);
     std::vector<uint8_t> batch_storage(kBatchSize * cfg.payload, 0x77);
-    std::array<std::span<const uint8_t>, kBatchSize> batch_spans{};
+    std::array<pollnet::IoSlice, kBatchSize> batch_slices{};
     for (size_t i = 0; i < kBatchSize; ++i) {
-        batch_spans[i] =
-            std::span<const uint8_t>{batch_storage.data() + i * cfg.payload, cfg.payload};
+        batch_slices[i] = pollnet::IoSlice{batch_storage.data() + i * cfg.payload, cfg.payload};
     }
 
     size_t sent_ok = 0;
     int64_t t0 = pollnet_bench::bench_now_ns();
     if constexpr (UseBatch) {
         for (size_t i = 0; i < target_msgs; i += kBatchSize) {
-            sent_ok += sender.sendBatch(batch_spans);
+            sent_ok += sender.sendBatch(batch_slices);
         }
     } else {
         for (size_t i = 0; i < target_msgs; ++i) {
@@ -605,38 +605,24 @@ int main(int argc, char** argv) {
             cfg.client_cpu);
     }
 
-    // 与 v1.1.0 同口径对比基准
     if (!run_tcp_ping_pong_server<pollnet::SocketTcpServer, false, false>(cfg, "tcp_ping_pong"))
         return 1;
     if (!run_tcp_ping_pong_server<pollnet::SocketTcpServer, true, false>(
             cfg, "tcp_ping_pong_ext_clock"))
         return 1;
-    if (!run_tcp_throughput<false>(cfg, "tcp_throughput")) return 1;
-    if (!run_udp_ping_pong(cfg)) return 1;
-    if (!run_udp_throughput<false>(cfg, "udp_tx_throughput", "udp_rx_throughput")) return 1;
-
-    // 新增专项优化验收基准
-    if (!run_tcp_throughput<true>(cfg, "tcp_writev_throughput")) return 1;
-    if (!run_udp_throughput<true>(cfg, "udp_batch_tx_throughput", "udp_batch_rx_throughput"))
-        return 1;
     if (!run_tcp_ping_pong_server<pollnet::EventLoopTcpServer, false, true>(
             cfg, "tcp_ping_pong_epoll"))
         return 1;
-#ifdef __linux__
-    if (!run_tcp_ping_pong_server<pollnet::IoUringTcpServer, false, true>(
-            cfg, "tcp_ping_pong_iouring"))
+    if (!run_tcp_throughput<false>(cfg, "tcp_throughput")) return 1;
+    if (!run_tcp_throughput<true>(cfg, "tcp_writev_throughput")) return 1;
+    if (!run_udp_ping_pong(cfg)) return 1;
+    if (!run_udp_throughput<false>(cfg, "udp_tx_throughput", "udp_rx_throughput")) return 1;
+    if (!run_udp_throughput<true>(cfg, "udp_batch_tx_throughput", "udp_batch_rx_throughput"))
         return 1;
-#endif
-
-    // 64 连接（1 活跃 + 63 空闲）跨后端对比
     if (!run_tcp_64conn_ping_pong<pollnet::SocketTcpServer, false>(cfg, "tcp_64conn_busy_poll"))
         return 1;
     if (!run_tcp_64conn_ping_pong<pollnet::EventLoopTcpServer, true>(cfg, "tcp_64conn_epoll"))
         return 1;
-#ifdef __linux__
-    if (!run_tcp_64conn_ping_pong<pollnet::IoUringTcpServer, true>(cfg, "tcp_64conn_iouring"))
-        return 1;
-#endif
 
     return 0;
 }
