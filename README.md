@@ -5,7 +5,7 @@
 ## 特性
 
 - **精简三层模块化设计（Linux + Windows 全平台一致）**：
-  - [core.h](include/pollnet/core.h)：后端无关核心（`Endpoint`、`pinThread`、`ByteRange`/`IoSlice`、`SendPart`、`Options` 及 `lowLatency*` 预设、`Concepts`、零开销 `FixedFrameHandler`/`LengthPrefixedHandler` 拆帧器）。
+  - [core.h](include/pollnet/core.h)：后端无关核心（`Endpoint`、`pinThread`、`ByteRange`/`IoSlice`、`SendPart`、`Options` 及 `lowLatency*` 预设、`Concepts`、零开销 `FixedFrameHandler`/`LengthPrefixedHandler`/`DelimiterFrameHandler` 拆帧器）。
   - [socket.h](include/pollnet/socket.h)：标准轮询后端（`TcpClient` / `TcpServer` / 统一 `UdpSocket`；支持可选零开销/静态环形发送缓冲 `SendBufSize`、可变参聚集写 `sendParts`、`accept` 节流、Linux `sendmmsg`/`recvmmsg` UDP 批量收发与 `sendStruct`/`recvStruct`）。
   - [eventloop.h](include/pollnet/eventloop.h)：跨平台事件循环后端 `EventLoopTcpServer`（Linux `epoll` / Windows `WSAPoll` / 通用 POSIX `poll`），支持多连接 $O(\text{active})$ 派发与可选 `SendBufSize` 可写事件续发。
 - **现代 C++20 API**：指定初始化器 `Options` 结构体与 `lowLatency` 预设、`std::chrono::milliseconds` 亚秒级超时、`std::span`/`ByteRange` 零拷贝视图与编译期 `if constexpr` 可选回调（仅 `onData` 必选）。

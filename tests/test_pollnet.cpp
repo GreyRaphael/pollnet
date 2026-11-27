@@ -1412,6 +1412,167 @@ bool test_framers_and_send_parts_and_udp_struct() {
         CHECK(got2.seq == 88 && got2.price == 654321);
     }
 
+    // 14d. DelimiterFrameHandler（单字节/多字节跨包分隔符、include_delimiter、超限及非法分隔符）
+    {
+        struct MinimalDelimHandler {
+            void onMessage(pollnet::TcpConnection<>&, std::span<const uint8_t>) {}
+        };
+        using MinDelimAdapter = pollnet::DelimiterFrameHandler<MinimalDelimHandler>;
+        static_assert(pollnet::TcpHandler<MinDelimAdapter, pollnet::TcpConnection<>>);
+        static_assert(!pollnet::HasOnConnect<MinDelimAdapter, pollnet::TcpConnection<>>);
+        static_assert(!pollnet::HasOnDisconnect<MinDelimAdapter, pollnet::TcpConnection<>>);
+        static_assert(!pollnet::HasAllowNewConnection<MinDelimAdapter>);
+
+        // 单字节 '\n'：粘包、空帧与半包
+        {
+            pollnet::TcpServer<> server;
+            CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
+            pollnet::TcpClient<> client;
+            CHECK(client.connect({.host = "127.0.0.1", .port = server.localPort()}));
+
+            struct SrvDelim {
+                int connected = 0;
+                std::vector<std::string> frames;
+                void onConnect(pollnet::TcpConnection<>&) { ++connected; }
+                void onMessage(pollnet::TcpConnection<>& conn, std::span<const uint8_t> frame) {
+                    std::string s(reinterpret_cast<const char*>(frame.data()), frame.size());
+                    frames.push_back(s);
+                    (void)conn.sendParts(s, std::string_view{"\n"});
+                }
+            } srv_inner;
+            struct CliDelim {
+                int connected = 0;
+                std::vector<std::string> frames;
+                void onConnect(pollnet::TcpConnection<>&) { ++connected; }
+                void onMessage(pollnet::TcpConnection<>&, std::span<const uint8_t> frame) {
+                    frames.emplace_back(reinterpret_cast<const char*>(frame.data()), frame.size());
+                }
+            } cli_inner;
+
+            auto srv_h = pollnet::makeDelimiterHandler('\n', srv_inner);
+            auto cli_h = pollnet::makeDelimiterHandler('\n', cli_inner);
+            static_assert(pollnet::HasOnConnect<decltype(srv_h), pollnet::TcpConnection<>>);
+
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                client.poll(cli_h);
+                return srv_inner.connected == 1 && cli_inner.connected == 1;
+            }));
+
+            CHECK(client.writeNonblock(std::string_view{"a\n\nbc"}));
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                client.poll(cli_h);
+                return srv_inner.frames.size() == 2 && cli_inner.frames.size() == 2;
+            }));
+            CHECK(client.writeNonblock(std::string_view{"\n"}));
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                client.poll(cli_h);
+                return srv_inner.frames.size() == 3 && cli_inner.frames.size() == 3;
+            }));
+            CHECK(cli_inner.frames[0] == "a" && cli_inner.frames[1].empty() &&
+                  cli_inner.frames[2] == "bc");
+        }
+
+        // 多字节 "\r\n" + include_delimiter = true + max_frame_len = 8 超限校验
+        {
+            pollnet::TcpServer<> server;
+            CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
+            pollnet::TcpClient<> client;
+            CHECK(client.connect({.host = "127.0.0.1", .port = server.localPort()}));
+
+            struct SrvMulti {
+                int connected = 0;
+                int disconnected = 0;
+                std::string reason;
+                std::vector<std::string> frames;
+                void onConnect(pollnet::TcpConnection<>&) { ++connected; }
+                void onDisconnect(pollnet::TcpConnection<>& c) {
+                    ++disconnected;
+                    reason = std::string(c.lastError());
+                }
+                void onMessage(pollnet::TcpConnection<>&, std::span<const uint8_t> frame) {
+                    frames.emplace_back(reinterpret_cast<const char*>(frame.data()), frame.size());
+                }
+            } srv_inner;
+            struct IdleCli {
+                int connected = 0;
+                void onConnect(pollnet::TcpConnection<>&) { ++connected; }
+                size_t onData(pollnet::TcpConnection<>&, std::span<const uint8_t> d) {
+                    return d.size();
+                }
+            } cli_h;
+
+            auto srv_h = pollnet::makeDelimiterHandler("\r\n", srv_inner, 8, true);
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                client.poll(cli_h);
+                return srv_inner.connected == 1 && cli_h.connected == 1;
+            }));
+
+            CHECK(client.writeNonblock(std::string_view{"hi\r"}));
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                return server.connCount() == 1 && srv_inner.frames.empty();
+            }));
+            CHECK(client.writeNonblock(std::string_view{"\n"}));
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                return srv_inner.frames.size() == 1;
+            }));
+            CHECK(srv_inner.frames[0] == "hi\r\n");
+
+            CHECK(client.writeNonblock(std::string_view{"12345678"}));
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                return srv_inner.disconnected == 1;
+            }));
+            CHECK(srv_inner.reason == "frame too large");
+        }
+
+        // 空分隔符应立即关闭连接并报错
+        {
+            pollnet::TcpServer<> server;
+            CHECK(server.listen({.host = "127.0.0.1", .port = 0}));
+            pollnet::TcpClient<> client;
+            CHECK(client.connect({.host = "127.0.0.1", .port = server.localPort()}));
+
+            struct BadDelimSrv {
+                int connected = 0;
+                int disconnected = 0;
+                std::string reason;
+                void onConnect(pollnet::TcpConnection<>&) { ++connected; }
+                void onDisconnect(pollnet::TcpConnection<>& c) {
+                    ++disconnected;
+                    reason = std::string(c.lastError());
+                }
+                void onMessage(pollnet::TcpConnection<>&, std::span<const uint8_t>) {}
+            } srv_inner;
+            struct IdleCli {
+                int connected = 0;
+                void onConnect(pollnet::TcpConnection<>&) { ++connected; }
+                size_t onData(pollnet::TcpConnection<>&, std::span<const uint8_t> d) {
+                    return d.size();
+                }
+            } cli_h;
+
+            auto srv_h = pollnet::makeDelimiterHandler("", srv_inner);
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                client.poll(cli_h);
+                return srv_inner.connected == 1 && cli_h.connected == 1;
+            }));
+
+            CHECK(client.writeNonblock(std::string_view{"x"}));
+            CHECK(poll_until([&]() {
+                server.poll(srv_h);
+                return srv_inner.disconnected == 1;
+            }));
+            CHECK(srv_inner.reason == "invalid delimiter");
+        }
+    }
+
     return true;
 }
 

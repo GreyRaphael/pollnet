@@ -666,4 +666,120 @@ template <typename HeaderT, typename LenFn, typename Handler>
     return LengthPrefixedHandler<HeaderT, LenFn, Handler>{std::move(len_fn), handler, max_body_len};
 }
 
+template <typename Handler>
+class DelimiterFrameHandler : public detail::HandlerForwarder<Handler> {
+   public:
+    static constexpr size_t kMaxDelimLen = 16;
+
+    DelimiterFrameHandler(char delim, Handler& handler, size_t max_frame_len = 0,
+                          bool include_delimiter = false) noexcept
+        : detail::HandlerForwarder<Handler>(handler),
+          delim_len_(1),
+          max_frame_len_(max_frame_len),
+          include_delimiter_(include_delimiter) {
+        delim_[0] = static_cast<uint8_t>(delim);
+    }
+
+    DelimiterFrameHandler(std::string_view delim, Handler& handler, size_t max_frame_len = 0,
+                          bool include_delimiter = false) noexcept
+        : detail::HandlerForwarder<Handler>(handler),
+          max_frame_len_(max_frame_len),
+          include_delimiter_(include_delimiter) {
+        if (!delim.empty() && delim.size() <= kMaxDelimLen) {
+            delim_len_ = delim.size();
+            std::memcpy(delim_, delim.data(), delim_len_);
+        }
+    }
+
+    template <typename Conn>
+        requires requires(Handler& h, Conn& c, std::span<const uint8_t> frame) {
+            h.onMessage(c, frame);
+        }
+    size_t onData(Conn& conn, std::span<const uint8_t> data) {
+        if (delim_len_ == 0) {
+            conn.close("invalid delimiter", false);
+            return data.size();
+        }
+
+        size_t max_frame = max_frame_len_;
+        if constexpr (requires { Conn::kRecvBufSize; }) {
+            if (max_frame == 0 || max_frame > Conn::kRecvBufSize) {
+                max_frame = Conn::kRecvBufSize;
+            }
+        } else if (max_frame == 0) {
+            max_frame = std::numeric_limits<size_t>::max();
+        }
+
+        size_t offset = 0;
+        while (data.size() - offset >= delim_len_) {
+            size_t rem = data.size() - offset;
+            size_t pos = rem;
+
+            if (delim_len_ == 1) {
+                const void* hit = std::memchr(data.data() + offset, delim_[0], rem);
+                if (hit != nullptr) {
+                    pos = static_cast<size_t>(static_cast<const uint8_t*>(hit) -
+                                              (data.data() + offset));
+                }
+            } else {
+                std::string_view hay{reinterpret_cast<const char*>(data.data() + offset), rem};
+                std::string_view needle{reinterpret_cast<const char*>(delim_), delim_len_};
+                size_t found = hay.find(needle);
+                if (found != std::string_view::npos) {
+                    pos = found;
+                }
+            }
+
+            if (pos == rem) {
+                size_t max_unmatched =
+                    include_delimiter_
+                        ? (max_frame > 0 ? max_frame - 1 : 0)
+                        : (max_frame <= std::numeric_limits<size_t>::max() - (delim_len_ - 1)
+                               ? max_frame + (delim_len_ - 1)
+                               : std::numeric_limits<size_t>::max());
+                if (rem > max_unmatched) {
+                    conn.close("frame too large", false);
+                    return data.size();
+                }
+                break;
+            }
+
+            size_t frame_total = pos + delim_len_;
+            size_t emit_len = include_delimiter_ ? frame_total : pos;
+            if (emit_len > max_frame) {
+                conn.close("frame too large", false);
+                return data.size();
+            }
+
+            this->handler_.onMessage(conn,
+                                     std::span<const uint8_t>{data.data() + offset, emit_len});
+            if (!conn.isConnected()) {
+                return data.size();
+            }
+            offset += frame_total;
+        }
+        return offset;
+    }
+
+   private:
+    uint8_t delim_[kMaxDelimLen]{};
+    size_t delim_len_ = 0;
+    size_t max_frame_len_ = 0;
+    bool include_delimiter_ = false;
+};
+
+template <typename Handler>
+[[nodiscard]] inline DelimiterFrameHandler<Handler> makeDelimiterHandler(
+    char delim, Handler& handler, size_t max_frame_len = 0,
+    bool include_delimiter = false) noexcept {
+    return DelimiterFrameHandler<Handler>{delim, handler, max_frame_len, include_delimiter};
+}
+
+template <typename Handler>
+[[nodiscard]] inline DelimiterFrameHandler<Handler> makeDelimiterHandler(
+    std::string_view delim, Handler& handler, size_t max_frame_len = 0,
+    bool include_delimiter = false) noexcept {
+    return DelimiterFrameHandler<Handler>{delim, handler, max_frame_len, include_delimiter};
+}
+
 }  // namespace pollnet
