@@ -10,6 +10,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -309,6 +310,54 @@ class UdpSocketBase {
         return ret == static_cast<int>(size);
     }
 
+    [[nodiscard]] size_t sendBatchImpl(std::span<const std::span<const uint8_t>> packets,
+                                       const Endpoint* dst) noexcept {
+        if (fd_ == INVALID_SOCKET_FD || packets.empty()) return 0;
+#ifdef __linux__
+        constexpr size_t kBatchSize = 64;
+        size_t total_sent = 0;
+        size_t offset = 0;
+        while (offset < packets.size()) {
+            size_t count = std::min(kBatchSize, packets.size() - offset);
+            struct mmsghdr msgs[kBatchSize]{};
+            struct iovec iovs[kBatchSize]{};
+            for (size_t i = 0; i < count; ++i) {
+                const auto& pkt = packets[offset + i];
+                iovs[i].iov_base = const_cast<uint8_t*>(pkt.data());
+                iovs[i].iov_len = pkt.size();
+                msgs[i].msg_hdr.msg_iov = &iovs[i];
+                msgs[i].msg_hdr.msg_iovlen = 1;
+                if (dst != nullptr) {
+                    msgs[i].msg_hdr.msg_name = const_cast<sockaddr_in*>(&dst->raw);
+                    msgs[i].msg_hdr.msg_namelen = sizeof(dst->raw);
+                }
+            }
+            int ret = 0;
+            do {
+                ret = ::sendmmsg(fd_, msgs, static_cast<unsigned int>(count), MSG_DONTWAIT);
+            } while (ret < 0 && is_eintr(get_last_error()));
+            if (ret <= 0) {
+                break;
+            }
+            total_sent += static_cast<size_t>(ret);
+            if (static_cast<size_t>(ret) < count) {
+                break;
+            }
+            offset += count;
+        }
+        return total_sent;
+#else
+        size_t total_sent = 0;
+        for (const auto& pkt : packets) {
+            bool ok = (dst != nullptr) ? sendTo(pkt.data(), pkt.size(), *dst)
+                                       : send(pkt.data(), pkt.size());
+            if (!ok) break;
+            ++total_sent;
+        }
+        return total_sent;
+#endif
+    }
+
     template <UdpDataHandler Handler>
     [[nodiscard]] bool recvImpl(uint8_t* buf, size_t buf_size, Handler& handler) {
         if (fd_ == INVALID_SOCKET_FD) return false;
@@ -340,6 +389,62 @@ class UdpSocketBase {
             return true;
         }
         return false;
+    }
+
+    template <size_t MaxBatch, size_t BufSize, bool WantPeer, typename Handler>
+    [[nodiscard]] size_t recvBatchImpl(Handler& handler) {
+        static_assert(MaxBatch > 0 && MaxBatch <= 64, "MaxBatch must be in [1, 64]");
+        static_assert(MaxBatch * BufSize <= 256 * 1024, "Batch stack buffer exceeds 256 KiB");
+        if (fd_ == INVALID_SOCKET_FD) return 0;
+
+#ifdef __linux__
+        alignas(16) uint8_t batch_buf[MaxBatch][BufSize];
+        struct mmsghdr msgs[MaxBatch]{};
+        struct iovec iovs[MaxBatch]{};
+        Endpoint peers[MaxBatch]{};
+
+        for (size_t i = 0; i < MaxBatch; ++i) {
+            iovs[i].iov_base = batch_buf[i];
+            iovs[i].iov_len = BufSize;
+            msgs[i].msg_hdr.msg_iov = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            if constexpr (WantPeer) {
+                msgs[i].msg_hdr.msg_name = &peers[i].raw;
+                msgs[i].msg_hdr.msg_namelen = sizeof(peers[i].raw);
+            }
+        }
+
+        int n = 0;
+        do {
+            n = ::recvmmsg(fd_, msgs, static_cast<unsigned int>(MaxBatch), MSG_DONTWAIT, nullptr);
+        } while (n < 0 && is_eintr(get_last_error()));
+
+        if (n <= 0) return 0;
+
+        for (int i = 0; i < n; ++i) {
+            size_t len = static_cast<size_t>(msgs[i].msg_len);
+            if (len > BufSize) len = BufSize;
+            if constexpr (WantPeer) {
+                handler(std::span<const uint8_t>{batch_buf[i], len}, peers[i]);
+            } else {
+                handler(std::span<const uint8_t>{batch_buf[i], len});
+            }
+        }
+        return static_cast<size_t>(n);
+#else
+        uint8_t single_buf[BufSize];
+        size_t count = 0;
+        for (; count < MaxBatch; ++count) {
+            bool ok = false;
+            if constexpr (WantPeer) {
+                ok = recvFromImpl(single_buf, BufSize, handler);
+            } else {
+                ok = recvImpl(single_buf, BufSize, handler);
+            }
+            if (!ok) break;
+        }
+        return count;
+#endif
     }
 
     void saveError(const char* msg, bool check_errno = true, int err_override = 0) noexcept {
@@ -483,6 +588,188 @@ class SocketTcpConnection : public UserData {
 
     [[nodiscard]] bool write(std::span<const uint8_t> data, bool more = false) noexcept {
         return write(data.data(), data.size(), more);
+    }
+
+    [[nodiscard]] int writevSome(std::span<const IoSlice> slices, bool more = false) noexcept {
+        if (fd_ == detail::INVALID_SOCKET_FD) return -1;
+        if (slices.empty()) return 0;
+
+        constexpr size_t kMaxIov = 64;
+#ifdef _WIN32
+        (void)more;
+        WSABUF bufs[kMaxIov];
+        DWORD buf_cnt = 0;
+        size_t total_len = 0;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (!s.data) {
+                close("invalid io slice", false);
+                return -1;
+            }
+            if (buf_cnt == kMaxIov) break;
+            if (s.size > static_cast<size_t>(std::numeric_limits<int>::max()) - total_len) {
+                close("send size overflow", false);
+                return -1;
+            }
+            bufs[buf_cnt].buf = const_cast<CHAR*>(reinterpret_cast<const CHAR*>(s.data));
+            bufs[buf_cnt].len = static_cast<ULONG>(s.size);
+            total_len += s.size;
+            ++buf_cnt;
+        }
+        if (buf_cnt == 0) return 0;
+
+        DWORD sent_bytes = 0;
+        int rc = ::WSASend(fd_, bufs, buf_cnt, &sent_bytes, 0, nullptr, nullptr);
+        if (rc == SOCKET_ERROR) {
+            int err = detail::get_last_error();
+            if (detail::is_would_block(err)) {
+                return 0;
+            }
+            close("WSASend error", true, err);
+            return -1;
+        }
+        if (sent_bytes > 0 && send_timeout_ns_ > 0) {
+            send_ts_ = now_ns();
+        }
+        return static_cast<int>(sent_bytes);
+#else
+        struct iovec iovs[kMaxIov];
+        size_t iov_cnt = 0;
+        size_t total_len = 0;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (!s.data) {
+                close("invalid io slice", false);
+                return -1;
+            }
+            if (iov_cnt == kMaxIov) break;
+            if (s.size > static_cast<size_t>(std::numeric_limits<int>::max()) - total_len) {
+                close("send size overflow", false);
+                return -1;
+            }
+            iovs[iov_cnt].iov_base = const_cast<void*>(s.data);
+            iovs[iov_cnt].iov_len = s.size;
+            total_len += s.size;
+            ++iov_cnt;
+        }
+        if (iov_cnt == 0) return 0;
+
+        struct msghdr msg{};
+        msg.msg_iov = iovs;
+        msg.msg_iovlen = static_cast<decltype(msg.msg_iovlen)>(iov_cnt);
+        int flags = MSG_NOSIGNAL;
+        if (more) flags |= MSG_MORE;
+
+        ssize_t ret = 0;
+        do {
+            ret = ::sendmsg(fd_, &msg, flags);
+        } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
+
+        if (ret < 0) {
+            int err = detail::get_last_error();
+            if (detail::is_would_block(err)) {
+                return 0;
+            }
+            close("sendmsg error", true, err);
+            return -1;
+        }
+        if (ret > 0 && send_timeout_ns_ > 0) {
+            send_ts_ = now_ns();
+        }
+        return static_cast<int>(ret);
+#endif
+    }
+
+    [[nodiscard]] bool writevNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
+        constexpr size_t kMaxIov = 64;
+        size_t total_bytes = 0;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (!s.data) {
+                close("invalid io slice", false);
+                return false;
+            }
+            if (s.size > static_cast<size_t>(std::numeric_limits<int>::max()) - total_bytes) {
+                close("send size overflow", false);
+                return false;
+            }
+            total_bytes += s.size;
+        }
+        if (total_bytes == 0) return isConnected();
+
+        if (slices.size() <= kMaxIov) {
+            int sent = writevSome(slices, more);
+            if (sent < 0) return false;
+            if (static_cast<size_t>(sent) != total_bytes) {
+                close("send buffer full", false);
+                return false;
+            }
+            return true;
+        }
+
+        size_t offset = 0;
+        while (offset < slices.size()) {
+            size_t count = std::min(kMaxIov, slices.size() - offset);
+            size_t chunk_bytes = 0;
+            for (size_t i = 0; i < count; ++i) chunk_bytes += slices[offset + i].size;
+            bool chunk_more = more || (offset + count < slices.size());
+            int sent = writevSome(slices.subspan(offset, count), chunk_more);
+            if (sent < 0) return false;
+            if (static_cast<size_t>(sent) != chunk_bytes) {
+                close("send buffer full", false);
+                return false;
+            }
+            offset += count;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool writev(std::span<const IoSlice> slices, bool more = false) noexcept {
+        constexpr size_t kMaxIov = 64;
+        size_t total_bytes = 0;
+        for (const auto& s : slices) {
+            if (s.size == 0) continue;
+            if (!s.data) {
+                close("invalid io slice", false);
+                return false;
+            }
+            total_bytes += s.size;
+        }
+        if (total_bytes == 0) return isConnected();
+
+        size_t idx = 0;
+        size_t slice_off = 0;
+        while (idx < slices.size()) {
+            std::array<IoSlice, kMaxIov> cur{};
+            size_t cnt = 0;
+            for (size_t i = idx; i < slices.size() && cnt < kMaxIov; ++i) {
+                size_t off = (i == idx) ? slice_off : 0;
+                if (slices[i].size <= off) continue;
+                cur[cnt++] = IoSlice{static_cast<const uint8_t*>(slices[i].data) + off,
+                                     slices[i].size - off};
+            }
+            if (cnt == 0) break;
+
+            int sent = writevSome(std::span<const IoSlice>{cur.data(), cnt}, more);
+            if (sent < 0) return false;
+            size_t adv = static_cast<size_t>(sent);
+            while (adv > 0 && idx < slices.size()) {
+                size_t avail = slices[idx].size - slice_off;
+                if (adv < avail) {
+                    slice_off += adv;
+                    adv = 0;
+                } else {
+                    adv -= avail;
+                    ++idx;
+                    slice_off = 0;
+                }
+            }
+            while (idx < slices.size() && slices[idx].size == 0) {
+                ++idx;
+                slice_off = 0;
+            }
+        }
+        return true;
     }
 
    protected:
@@ -714,6 +1001,16 @@ class SocketTcpClient {
     }
     [[nodiscard]] bool write(std::span<const uint8_t> data, bool more = false) noexcept {
         return conn_.write(data, more);
+    }
+
+    [[nodiscard]] int writevSome(std::span<const IoSlice> slices, bool more = false) noexcept {
+        return conn_.writevSome(slices, more);
+    }
+    [[nodiscard]] bool writevNonblock(std::span<const IoSlice> slices, bool more = false) noexcept {
+        return conn_.writevNonblock(slices, more);
+    }
+    [[nodiscard]] bool writev(std::span<const IoSlice> slices, bool more = false) noexcept {
+        return conn_.writev(slices, more);
     }
 
     template <typename Handler>
@@ -1074,6 +1371,9 @@ class SocketUdpSocket {
     [[nodiscard]] bool send(std::span<const uint8_t> data) noexcept {
         return base_.send(data.data(), data.size());
     }
+    [[nodiscard]] size_t sendBatch(std::span<const std::span<const uint8_t>> packets) noexcept {
+        return base_.sendBatchImpl(packets, nullptr);
+    }
 
     [[nodiscard]] bool sendTo(const void* data, size_t size, const Endpoint& dst) noexcept {
         return base_.sendTo(data, size, dst);
@@ -1084,6 +1384,10 @@ class SocketUdpSocket {
     [[nodiscard]] bool sendTo(std::span<const uint8_t> data, const Endpoint& dst) noexcept {
         return base_.sendTo(data.data(), data.size(), dst);
     }
+    [[nodiscard]] size_t sendToBatch(std::span<const std::span<const uint8_t>> packets,
+                                     const Endpoint& dst) noexcept {
+        return base_.sendBatchImpl(packets, &dst);
+    }
 
     template <UdpDataHandler Handler>
     [[nodiscard]] bool recv(Handler handler) {
@@ -1093,6 +1397,16 @@ class SocketUdpSocket {
     template <UdpPacketHandler Handler>
     [[nodiscard]] bool recvFrom(Handler handler) {
         return base_.recvFromImpl(buf_, RecvBufSize, handler);
+    }
+
+    template <size_t MaxBatch = 16, UdpDataHandler Handler>
+    [[nodiscard]] size_t recvBatch(Handler handler) {
+        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, false>(handler);
+    }
+
+    template <size_t MaxBatch = 16, UdpPacketHandler Handler>
+    [[nodiscard]] size_t recvFromBatch(Handler handler) {
+        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, true>(handler);
     }
 
    private:
@@ -1145,6 +1459,16 @@ class SocketUdpReceiver {
         return base_.recvFromImpl(buf_, RecvBufSize, handler);
     }
 
+    template <size_t MaxBatch = 16, UdpDataHandler Handler>
+    [[nodiscard]] size_t recvBatch(Handler handler) {
+        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, false>(handler);
+    }
+
+    template <size_t MaxBatch = 16, UdpPacketHandler Handler>
+    [[nodiscard]] size_t recvFromBatch(Handler handler) {
+        return base_.template recvBatchImpl<MaxBatch, RecvBufSize, true>(handler);
+    }
+
     [[nodiscard]] bool sendTo(const void* data, size_t size, const Endpoint& dst) noexcept {
         return base_.sendTo(data, size, dst);
     }
@@ -1153,6 +1477,10 @@ class SocketUdpReceiver {
     }
     [[nodiscard]] bool sendTo(std::span<const uint8_t> data, const Endpoint& dst) noexcept {
         return base_.sendTo(data.data(), data.size(), dst);
+    }
+    [[nodiscard]] size_t sendToBatch(std::span<const std::span<const uint8_t>> packets,
+                                     const Endpoint& dst) noexcept {
+        return base_.sendBatchImpl(packets, &dst);
     }
 
    private:
@@ -1202,6 +1530,9 @@ class SocketUdpSender {
     }
     [[nodiscard]] bool send(std::span<const uint8_t> data) noexcept {
         return base_.send(data.data(), data.size());
+    }
+    [[nodiscard]] size_t sendBatch(std::span<const std::span<const uint8_t>> packets) noexcept {
+        return base_.sendBatchImpl(packets, nullptr);
     }
 
    private:

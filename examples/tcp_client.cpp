@@ -1,3 +1,4 @@
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -37,14 +38,14 @@ class ClientHandler {
             MsgHeader header{};
             header.body_len = htonl(static_cast<uint32_t>(msg.size()));
 
-            std::string packet;
-            packet.resize(sizeof(MsgHeader) + msg.size());
-            std::memcpy(packet.data(), &header, sizeof(MsgHeader));
-            std::memcpy(packet.data() + sizeof(MsgHeader), msg.data(), msg.size());
-
-            if (!conn.write(packet.data(), packet.size()) ||
-                !conn.write(packet.data(), packet.size())) {
-                std::cout << std::format("write error: {}\n", conn.lastError());
+            std::array<pollnet::IoSlice, 4> iov{{
+                {&header, sizeof(MsgHeader)},
+                {msg},
+                {&header, sizeof(MsgHeader)},
+                {msg},
+            }};
+            if (!conn.writev(iov)) {
+                std::cout << std::format("writev error: {}\n", conn.lastError());
             }
         }
         is_first_ = false;
