@@ -37,6 +37,56 @@ int main() {
 }
 ```
 
+## 集成到其他项目
+
+`pollnet` 为纯 **header-only** 库（无 `.cpp` 源文件、零第三方依赖），可通过以下两种方式集成：
+
+### 方式一：直接拷贝头文件（如放到 `third_party/pollnet/`）
+
+将 `include/pollnet/` 目录下的 `core.h`、`socket.h`、`eventloop.h` 拷贝至目标项目（例如 `third_party/pollnet/`），内部通过 `"pollnet/..."` 互相引用，因此只需将 `third_party` 加入 include 搜索路径即可：
+
+```cmake
+add_executable(your_app src/main.cpp)
+
+target_include_directories(your_app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
+
+target_compile_features(your_app PRIVATE cxx_std_20)
+
+if(WIN32)
+    target_link_libraries(your_app PRIVATE ws2_32)
+endif()
+```
+
+代码中按需包含：
+
+```cpp
+#include "pollnet/socket.h"     // TcpClient / TcpServer / UdpSocket
+// 或
+#include "pollnet/eventloop.h"  // EventLoopTcpServer（内部已包含 socket.h 与 core.h）
+```
+
+### 方式二：作为 CMake 子目录引入
+
+将仓库放到子目录并通过 `add_subdirectory` 引入时，可关闭示例、测试与基准目标后直接链接 `pollnet`（`INTERFACE` 库）：
+
+```cmake
+set(POLLNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(POLLNET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(POLLNET_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/pollnet)
+
+target_link_libraries(your_app PRIVATE pollnet)
+```
+
+### 集成注意事项
+
+- **C++20 标准库支持**：使用了 `<concepts>`、`<span>`、`<ranges>`、`<format>`，需使用支持完整 C++20 特性集的编译器（如 GCC 13+ / Clang 16+ / MSVC 2022）。
+- **系统库链接**：Linux 下无需额外链接第三方或系统网络库；Windows 下 MSVC 会通过 `#pragma comment(lib, "ws2_32.lib")` 自动链接，但 MinGW 会忽略该指令，建议在 CMake 中统一通过 `if(WIN32)` 显式链接 `ws2_32`。
+- **Windows `<windows.h>` 包含顺序**：若业务代码同时包含 `<windows.h>`，请先包含 `"pollnet/socket.h"`（或在包含 `<windows.h>` 前定义 `WIN32_LEAN_AND_MEAN`），避免旧版 `<winsock.h>` 与 `<winsock2.h>` 冲突。
+
 ## 目录结构
 
 ```text
