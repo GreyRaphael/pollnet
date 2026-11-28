@@ -34,6 +34,12 @@ jobs:
             cc: ""
             cxx: ""
             build_type: Release
+          - name: Linux GCC ASan+UBSan
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+            cxx_flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
 
     steps:
       - name: Checkout
@@ -46,7 +52,11 @@ jobs:
             export CC="${{ matrix.cc }}"
             export CXX="${{ matrix.cxx }}"
           fi
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake_args=(-S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }})
+          if [ -n "${{ matrix.cxx_flags }}" ]; then
+            cmake_args+=("-DCMAKE_CXX_FLAGS=${{ matrix.cxx_flags }}")
+          fi
+          cmake "${cmake_args[@]}"
 
       - name: Build
         shell: bash
@@ -56,10 +66,21 @@ jobs:
         shell: bash
         run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
 
+      - name: Benchmark Smoke Run
+        if: matrix.name == 'Linux GCC Release'
+        shell: bash
+        run: ./build/pollnet_bench --warmup 200 --iters 1000 --throughput-iters 2000 --payload 64
+
       - name: Standalone Compile Check (without CMake)
         if: matrix.name == 'Linux GCC Release'
         shell: bash
         run: |
-          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude examples/tcp_server.cpp -o /tmp/standalone_tcp_server
-          g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude tests/test_pollnet.cpp -o /tmp/standalone_test
-          /tmp/standalone_test
+          FLAGS="-std=c++20 -O2 -fno-exceptions -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror -Iinclude"
+          g++ $FLAGS examples/tcp_server.cpp -o /tmp/standalone_tcp_server
+          g++ $FLAGS examples/framer_demo.cpp -o /tmp/standalone_framer_demo
+          g++ $FLAGS tests/test_tcp.cpp tests/odr_helper.cpp -o /tmp/standalone_test_tcp
+          g++ $FLAGS tests/test_udp.cpp -o /tmp/standalone_test_udp
+          g++ $FLAGS tests/test_framer.cpp -o /tmp/standalone_test_framer
+          /tmp/standalone_test_tcp
+          /tmp/standalone_test_udp
+          /tmp/standalone_test_framer

@@ -112,11 +112,11 @@ target_link_libraries(your_app PRIVATE pollnet::pollnet)
 │   ├── socket.h                   # Linux + Windows 轮询后端（TCP + 统一 UdpSocket）
 │   └── eventloop.h                # 跨平台 EventLoop 后端（Linux epoll / Windows WSAPoll）
 ├── examples/                      # TCP / UDP 示例程序
-├── tests/test_pollnet.cpp         # 自动化单元测试
+├── tests/                         # 模块化单元测试 (TCP/UDP/Framer/ODR)
 ├── benchmarks/
 │   ├── bench_common.h             # Benchmark 公共计时、绑核与统计工具
 │   └── bench.cpp                  # 性能基准程序 (CMake target: pollnet_bench)
-├── .github/workflows/ci.yml       # Linux (GCC/Clang) & Windows (MSVC/MinGW) CI
+├── .github/workflows/ci.yml       # Linux (GCC/Clang/ASan+UBSan) & Windows CI
 ├── .github/workflows/release.yml
 └── CMakeLists.txt
 ```

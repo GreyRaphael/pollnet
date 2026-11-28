@@ -661,7 +661,8 @@ class SocketTcpConnection : public UserData {
 #endif
         int ret = 0;
         do {
-            ret = ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), flags);
+            ret = static_cast<int>(
+                ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), flags));
         } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (ret < 0) {
@@ -795,8 +796,9 @@ class SocketTcpConnection : public UserData {
 
         int ret = 0;
         do {
-            ret = ::recv(fd_, reinterpret_cast<char*>(recvbuf_ + tail_),
-                         static_cast<int>(RecvBufSize - tail_), 0);
+            ret = static_cast<int>(
+                ::recv(fd_, reinterpret_cast<char*>(recvbuf_ + tail_),
+                       static_cast<int>(RecvBufSize - tail_), 0));
         } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (ret <= 0) {
@@ -1409,7 +1411,8 @@ class SocketUdpSocket {
         if (size > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
         int ret = 0;
         do {
-            ret = ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0);
+            ret = static_cast<int>(
+                ::send(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0));
         } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
         return ret == static_cast<int>(size);
     }
@@ -1425,8 +1428,9 @@ class SocketUdpSocket {
         if (size > static_cast<size_t>(std::numeric_limits<int>::max())) return false;
         int ret = 0;
         do {
-            ret = ::sendto(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
-                           reinterpret_cast<const struct sockaddr*>(&dst.raw), sizeof(dst.raw));
+            ret = static_cast<int>(
+                ::sendto(fd_, reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
+                         reinterpret_cast<const struct sockaddr*>(&dst.raw), sizeof(dst.raw)));
         } while (ret < 0 && detail::is_eintr(detail::get_last_error()));
         return ret == static_cast<int>(size);
     }
@@ -1445,7 +1449,8 @@ class SocketUdpSocket {
         if (fd_ == detail::INVALID_SOCKET_FD) return false;
         int n = 0;
         do {
-            n = ::recv(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0);
+            n = static_cast<int>(
+                ::recv(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0));
         } while (n < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (n > 0) {
@@ -1462,8 +1467,9 @@ class SocketUdpSocket {
         socklen_t addrlen = sizeof(peer_ep.raw);
         int n = 0;
         do {
-            n = ::recvfrom(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0,
-                           reinterpret_cast<struct sockaddr*>(&peer_ep.raw), &addrlen);
+            n = static_cast<int>(
+                ::recvfrom(fd_, reinterpret_cast<char*>(buf_), static_cast<int>(RecvBufSize), 0,
+                           reinterpret_cast<struct sockaddr*>(&peer_ep.raw), &addrlen));
         } while (n < 0 && detail::is_eintr(detail::get_last_error()));
 
         if (n > 0) {
